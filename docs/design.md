@@ -537,7 +537,7 @@ behaviour adds or amends an item here in the same branch.
     consumers, but no strict driver-queue bound is claimed. Admission and pool sizing still
     require workload measurements. Rejected: per-reader PostgreSQL sessions, LISTEN in the query
     pool, blocking global fanout, lossy mixed Poke/Keepalive mailboxes, and a WAL/read-store rewrite.
-    Effect, sql-pg and effect/vitest are aligned at 4.1.2. The existing scoped pin-ownership
+    Effect, sql-pg and effect/vitest are aligned at 4.1.4. The existing scoped pin-ownership
     sql-pg patch remains necessary in that release; dependency patches are not inherited by
     consumers, so applications must retain it at their package-manager root.
 

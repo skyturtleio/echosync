@@ -97,7 +97,10 @@ const tallyBatch = (id: string, command: unknown): Wire.ExecuteRequest => ({
 // Every scenario owns a temporary schema, including its engine singleton and listener connections.
 let nextSchema = 0
 const scenario = <A, E>(
-  body: (server: Server.Server, sql: PgClient.PgClient) => Effect.Effect<A, E, Scope.Scope | PgClient.PgClient>,
+  body: (
+    server: Server.Server,
+    sql: PgClient.PgClient & SqlClient.SqlClient
+  ) => Effect.Effect<A, E, Scope.Scope | PgClient.PgClient>,
   maxConnections = 12,
   actions: ReadonlyArray<Server.Action.Action> = []
 ) =>

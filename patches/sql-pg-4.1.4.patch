@@ -1,6 +1,6 @@
 --- a/src/PgConnection.ts
 +++ b/src/PgConnection.ts
-@@ -762,13 +762,21 @@
+@@ -791,13 +791,21 @@
  
    // Only the waits are interruptible, so a caller can bound how long it waits
    // for the connection without leaking the `owner` permit.
@@ -25,7 +25,7 @@
            () => {
              this.pinned = true
              return new PinnedPgConnection(this)
-@@ -799,7 +807,7 @@
+@@ -828,7 +836,7 @@
                "PgConnection: Pinned connection released in an aborted transaction"
              ))
            }
@@ -36,7 +36,7 @@
      { interruptible: true }
 --- a/dist/PgConnection.js
 +++ b/dist/PgConnection.js
-@@ -406,10 +406,15 @@
+@@ -432,10 +432,15 @@
    });
    // Only the waits are interruptible, so a caller can bound how long it waits
    // for the connection without leaking the `owner` permit.
@@ -54,7 +54,7 @@
      this.pinned = true;
      return new PinnedPgConnection(this);
    }))), view => Effect.flatMap(Effect.suspend(() => {
-@@ -427,7 +432,7 @@
+@@ -453,7 +458,7 @@
        // statement failing. A transaction open before the pin is its caller's.
        this.fatal(connectionQueryError(new Error("Pinned connection released in an aborted transaction"), "PgConnection: Pinned connection released in an aborted transaction"));
      }
@@ -63,7 +63,7 @@
    }), {
      interruptible: true
    });
-@@ -1737,4 +1742,4 @@
+@@ -1790,4 +1795,4 @@
      operation
    });
  };
