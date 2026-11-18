@@ -6,45 +6,6 @@ import { SqlClient } from "effect/sql"
 import { Grant, privateScope, type Principal } from "../domain/Scope.ts"
 import * as Wire from "../protocol.ts"
 
-/** Called only by the explicit engine migration. Existing cursors become the log floor. */
-export const migrate = Effect.gen(function* () {
-  const sql = yield* SqlClient.SqlClient
-  yield* sql`UPDATE echosync_engine SET cursor=cursor`
-  // After the engine lock, like every writer: locking streams first could deadlock a live writer.
-  // Pattern ops serve both scope equality and the collation-independent 'catalog:%' prefix.
-  yield* sql`CREATE INDEX IF NOT EXISTS echosync_streams_scope ON echosync_streams(scope text_pattern_ops,aggregate,id)`
-  yield* sql`ALTER TABLE echosync_engine ADD COLUMN IF NOT EXISTS sync_generation bigint NOT NULL DEFAULT 0`
-  yield* sql`CREATE TABLE IF NOT EXISTS echosync_scope_floors(scope text PRIMARY KEY, cursor bigint NOT NULL)`
-  yield* sql`INSERT INTO echosync_scope_floors SELECT scope,cursor FROM echosync_scopes ON CONFLICT DO NOTHING`
-  // A principal's own catchup floor per granted scope: the revision its grant took effect.
-  // Grants older than this table are covered by the scope floors their grant raised.
-  yield* sql`CREATE TABLE IF NOT EXISTS echosync_grant_floors(scope text NOT NULL, principal text NOT NULL, cursor bigint NOT NULL, PRIMARY KEY(scope,principal))`
-  yield* sql`CREATE TABLE IF NOT EXISTS echosync_scope_changes(scope text NOT NULL, revision bigint NOT NULL, aggregate text NOT NULL,id text NOT NULL,PRIMARY KEY(scope,revision,aggregate,id))`
-  // Engine writers hold the singleton lock and advance it once after all stream mutations.
-  // Store identities, not historical state: catchup returns only the authorized current view.
-  // Age for retention only chooses each scope's floor; deletion is by revision at or below it,
-  // so imperfect ordering (rows that predate the column) keeps history longer, never loses it.
-  yield* sql`ALTER TABLE echosync_scope_changes ADD COLUMN IF NOT EXISTS at timestamptz NOT NULL DEFAULT clock_timestamp()`
-  yield* sql`CREATE OR REPLACE FUNCTION echosync_track_stream() RETURNS trigger LANGUAGE plpgsql AS $body$
-    DECLARE revision bigint;
-    BEGIN
-      SELECT cursor+1 INTO revision FROM echosync_engine;
-      IF TG_OP <> 'INSERT' THEN
-        INSERT INTO echosync_scope_changes VALUES(OLD.scope,revision,OLD.aggregate,OLD.id) ON CONFLICT DO NOTHING;
-      END IF;
-      IF TG_OP <> 'DELETE' THEN
-        INSERT INTO echosync_scope_changes VALUES(NEW.scope,revision,NEW.aggregate,NEW.id) ON CONFLICT DO NOTHING;
-      END IF;
-      RETURN NULL;
-    END
-  $body$`
-  yield* sql`DROP TRIGGER IF EXISTS echosync_track_stream ON echosync_streams`
-  yield* sql`CREATE TRIGGER echosync_track_stream AFTER INSERT OR UPDATE OR DELETE ON echosync_streams FOR EACH ROW EXECUTE FUNCTION echosync_track_stream()`
-  yield* sql`CREATE TABLE IF NOT EXISTS echosync_pull_sessions(id uuid PRIMARY KEY DEFAULT gen_random_uuid(),principal text NOT NULL,epoch text NOT NULL,grant_position bigint NOT NULL,generation bigint NOT NULL,expires_at timestamptz NOT NULL DEFAULT now()+interval '5 minutes',response jsonb NOT NULL)`
-  yield* sql`CREATE INDEX IF NOT EXISTS echosync_pull_expiry ON echosync_pull_sessions(expires_at)`
-  yield* sql`CREATE TABLE IF NOT EXISTS echosync_pull_entries(session uuid NOT NULL REFERENCES echosync_pull_sessions(id) ON DELETE CASCADE,position bigint NOT NULL,scope text NOT NULL,entry jsonb NOT NULL,PRIMARY KEY(session,position))`
-})
-
 /** Must run inside the serialized engine transaction. Never changes receipt/authority identity. */
 export const compact = Effect.fnUntraced(function* (through: number) {
   const sql = yield* SqlClient.SqlClient

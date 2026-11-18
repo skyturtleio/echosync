@@ -9,7 +9,7 @@ import * as Option from "effect/Option"
 import * as Predicate from "effect/Predicate"
 import * as Schema from "effect/Schema"
 import type * as ResourceScope from "effect/Scope"
-import type * as Stream from "effect/Stream"
+import * as Stream from "effect/Stream"
 import * as Str from "effect/String"
 import { HttpServerRequest, HttpServerResponse } from "effect/http"
 import { RpcSerialization, RpcServer } from "effect/rpc"
@@ -24,9 +24,11 @@ import * as Wire from "../protocol.ts"
 import * as OperationTelemetry from "../Telemetry.ts"
 import type * as Action from "./Action.ts"
 import * as Changes from "./Changes.ts"
+import * as Migration from "./Migration.ts"
 import * as Sync from "./Sync.ts"
 import * as Telemetry from "./Telemetry.ts"
 export * as Action from "./Action.ts"
+export { migrate, SchemaIncompatible, schemaStatus, type SchemaStatus } from "./Migration.ts"
 
 const decode = <S extends Codec>(schema: S, value: unknown) =>
   Schema.decodeUnknownEffect(Payload.persisted(schema))(value)
@@ -42,66 +44,12 @@ const sanitize = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
       if (Cause.hasInterruptsOnly(cause)) return Effect.interrupt
       const error = Option.getOrUndefined(Cause.findErrorOption(cause))
       return Effect.fail(
-        Schema.is(Wire.ResyncRequired)(error)
+        Schema.is(Wire.ResyncRequired)(error) || Schema.is(Migration.SchemaIncompatible)(error)
           ? error
           : new Wire.ServerError({ message: "EchoSync storage operation failed" })
       )
     })
   )
-
-/** Run explicitly during application migration, never automatically during request handling. */
-export const migrate = Effect.gen(function* () {
-  const sql = yield* SqlClient.SqlClient
-  return yield* sql.withTransaction(
-    Effect.gen(function* () {
-      yield* sql`SELECT pg_advisory_xact_lock(hashtextextended('echosync:migrate:' || current_schema(),0))`
-      // One-time in-place naming migration. These source names are not runtime aliases.
-      yield* sql`DO $echosync$
-    DECLARE
-      suffix text;
-      old_name text;
-      new_name text;
-      table_id oid;
-      item record;
-    BEGIN
-      FOREACH suffix IN ARRAY ARRAY['engine','scopes','streams','events','receipts','catalog_releases','grants','grant_events','imports','connections','presence'] LOOP
-        old_name := 'echo_' || suffix;
-        new_name := 'echosync_' || suffix;
-        IF to_regclass(format('%I.%I',current_schema(),old_name)) IS NOT NULL THEN
-          IF to_regclass(format('%I.%I',current_schema(),new_name)) IS NOT NULL THEN
-            RAISE EXCEPTION 'EchoSync naming collision for %', new_name;
-          END IF;
-          EXECUTE format('ALTER TABLE %I.%I RENAME TO %I',current_schema(),old_name,new_name);
-        END IF;
-        table_id := to_regclass(format('%I.%I',current_schema(),new_name));
-        FOR item IN SELECT conname FROM pg_constraint WHERE conrelid=table_id AND starts_with(conname,'echo_') LOOP
-          EXECUTE format('ALTER TABLE %I.%I RENAME CONSTRAINT %I TO %I',current_schema(),new_name,item.conname,'echosync_' || substr(item.conname,6));
-        END LOOP;
-        FOR item IN SELECT c.relname FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid WHERE i.indrelid=table_id AND starts_with(c.relname,'echo_') LOOP
-          EXECUTE format('ALTER INDEX %I.%I RENAME TO %I',current_schema(),item.relname,'echosync_' || substr(item.relname,6));
-        END LOOP;
-      END LOOP;
-      IF to_regclass(format('%I.echo_grant_events_position_seq',current_schema())) IS NOT NULL THEN
-        EXECUTE format('ALTER SEQUENCE %I.echo_grant_events_position_seq RENAME TO echosync_grant_events_position_seq',current_schema());
-      END IF;
-    END
-  $echosync$`
-      yield* sql`CREATE TABLE IF NOT EXISTS echosync_engine (singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton), epoch text NOT NULL, cursor bigint NOT NULL DEFAULT 0)`
-      yield* sql`INSERT INTO echosync_engine(singleton,epoch) VALUES(true,gen_random_uuid()::text) ON CONFLICT DO NOTHING`
-      yield* sql`CREATE TABLE IF NOT EXISTS echosync_scopes (scope text PRIMARY KEY,cursor bigint NOT NULL)`
-      yield* sql`CREATE TABLE IF NOT EXISTS echosync_streams (aggregate text NOT NULL,id text NOT NULL,scope text NOT NULL,seq integer NOT NULL,state jsonb NOT NULL,PRIMARY KEY(aggregate,id))`
-      yield* sql`CREATE TABLE IF NOT EXISTS echosync_events (aggregate text NOT NULL,id text NOT NULL,seq integer NOT NULL,payload jsonb NOT NULL,batch_id text NOT NULL,principal text NOT NULL,at timestamptz NOT NULL,PRIMARY KEY(aggregate,id,seq))`
-      yield* sql`CREATE TABLE IF NOT EXISTS echosync_receipts (principal text NOT NULL,client_id text NOT NULL,batch_id text NOT NULL,request jsonb NOT NULL,receipt jsonb NOT NULL,PRIMARY KEY(principal,client_id,batch_id))`
-      yield* sql`CREATE TABLE IF NOT EXISTS echosync_catalog_releases (scope text NOT NULL,release text NOT NULL,cursor bigint NOT NULL,PRIMARY KEY(scope,release))`
-      yield* sql`CREATE TABLE IF NOT EXISTS echosync_grants (scope text NOT NULL,principal text NOT NULL,role text NOT NULL CHECK(role IN ('reader','writer','owner')),PRIMARY KEY(scope,principal))`
-      yield* sql`CREATE TABLE IF NOT EXISTS echosync_grant_events (position bigserial PRIMARY KEY,scope text NOT NULL,subject text NOT NULL,role text,actor text NOT NULL,batch_id text NOT NULL,at timestamptz NOT NULL)`
-      yield* sql`CREATE TABLE IF NOT EXISTS echosync_imports (id text PRIMARY KEY,request jsonb NOT NULL)`
-      yield* sql`CREATE TABLE IF NOT EXISTS echosync_connections (id text PRIMARY KEY,principal text NOT NULL,expires_at timestamptz NOT NULL)`
-      yield* sql`CREATE TABLE IF NOT EXISTS echosync_presence (connection_id text NOT NULL REFERENCES echosync_connections(id) ON DELETE CASCADE,room text NOT NULL,client_id text NOT NULL,state jsonb NOT NULL,expires_at timestamptz NOT NULL,PRIMARY KEY(connection_id,room,client_id))`
-      yield* Sync.migrate
-    })
-  )
-})
 
 interface Row {
   readonly aggregate: string
@@ -155,7 +103,7 @@ export interface ImportRequest {
   readonly streams: ReadonlyArray<ImportedStream>
   readonly grants?: ReadonlyArray<Grant>
 }
-export type ServerFailure = Wire.ServerError | Wire.ResyncRequired
+export type ServerFailure = Wire.ServerError | Wire.ResyncRequired | Migration.SchemaIncompatible
 export interface Server {
   readonly execute: (
     principal: Principal,
@@ -173,7 +121,9 @@ export interface Server {
   /** Operator-only, atomic replay. Quiesce incompatible deployments first; catalogs must be reingested. */
   readonly rebuildProjections: (aggregates: ReadonlyArray<Aggregate.Any>) => Effect.Effect<number, ServerFailure>
   readonly resetEpoch: Effect.Effect<string, ServerFailure>
-  readonly changes: (principal: Principal) => Stream.Stream<Wire.Change, Wire.ServerError>
+  readonly changes: (
+    principal: Principal
+  ) => Stream.Stream<Wire.Change, Wire.ServerError | Migration.SchemaIncompatible>
   readonly presence: (principal: Principal, request: Wire.PresenceRequest) => Effect.Effect<void, ServerFailure>
 }
 
@@ -222,6 +172,20 @@ export const make = Effect.fn("EchoSync.Server.make")(function* (
             (error.reason._tag === "SerializationError" || error.reason._tag === "DeadlockError")
         })
       )
+  // Construction works on any database (an application may need a Server inside its own
+  // migrations); serving sync refuses a schema behind the code. Schemas only move forward, so
+  // once current or ahead is seen this process stops checking.
+  let compatible = false
+  const requireSchema = Effect.gen(function* () {
+    if (compatible) return
+    const status = yield* Migration.schemaStatus.pipe(
+      Effect.provideService(SqlClient.SqlClient, sql),
+      Effect.mapError(() => new Wire.ServerError({ message: "EchoSync storage operation failed" }))
+    )
+    if (status.status === "pending" || status.status === "diverged")
+      return yield* new Migration.SchemaIncompatible({ ...status, status: status.status })
+    compatible = true
+  })
   const engine = Effect.gen(function* () {
     const rows = yield* sql<Engine>`SELECT epoch,cursor::text FROM echosync_engine`
     return rows[0] ?? fail("Run EchoSync migrate before serving requests")
@@ -285,6 +249,7 @@ export const make = Effect.fn("EchoSync.Server.make")(function* (
     )
   }, protect("rebuildProjections"))
   const execute = Effect.fn("EchoSync.Execute")(function* (principal: Principal, request: Wire.ExecuteRequest) {
+    yield* requireSchema
     const now = yield* DateTime.now
     const receipts: Array<Wire.Receipt> = []
     let epoch = ""
@@ -556,6 +521,7 @@ export const make = Effect.fn("EchoSync.Server.make")(function* (
     principal: Principal,
     request: Wire.PullRequest
   ): Effect.fn.Return<Wire.PullResponse, unknown> {
+    yield* requireSchema
     if (request.incremental === true)
       return yield* Sync.pull(principal, request).pipe(Effect.provideService(PgClient.PgClient, sql))
     return yield* sql.withTransaction(
@@ -778,6 +744,7 @@ export const make = Effect.fn("EchoSync.Server.make")(function* (
   const presence = Effect.fn("EchoSync.Presence")(function* (principal: Principal, request: Wire.PresenceRequest) {
     if ((yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Json))(request.state)).length > 8192)
       return yield* new Wire.ServerError({ message: "Presence state too large" })
+    yield* requireSchema
     yield* transaction(
       Effect.gen(function* () {
         const connection =
@@ -837,10 +804,18 @@ export const make = Effect.fn("EchoSync.Server.make")(function* (
     importStreams,
     rebuildProjections,
     resetEpoch,
-    changes: (principal) => Telemetry.changes(changes(principal)),
+    changes: (principal) => Telemetry.changes(Stream.unwrap(requireSchema.pipe(Effect.as(changes(principal))))),
     presence
   }
 })
+
+// Retryable for every client; a new wire error variant would be a defect in open older bundles.
+const wire = <E>(error: E | Migration.SchemaIncompatible): E | Wire.ServerError =>
+  Schema.is(Migration.SchemaIncompatible)(error)
+    ? new Wire.ServerError({
+        message: `EchoSync schema ${error.status} (recorded ${error.recorded}, expected ${error.expected}); run Server.migrate`
+      })
+    : error
 
 /** Mount this HTTP effect at the application's sync route; authentication runs for every request. */
 export const httpApp = Effect.fnUntraced(function* <E, R>(
@@ -851,10 +826,10 @@ export const httpApp = Effect.fnUntraced(function* <E, R>(
   if (request.headers["x-echosync-protocol"] !== "2") return HttpServerResponse.empty({ status: 426 })
   const principal = yield* authenticate(request)
   const handlers = Wire.EchoSyncRpcs.toLayer({
-    Execute: (input) => server.execute(principal, input),
-    Pull: (input) => server.pull(principal, input),
-    Changes: () => server.changes(principal),
-    Presence: (input) => server.presence(principal, input)
+    Execute: (input) => server.execute(principal, input).pipe(Effect.mapError(wire)),
+    Pull: (input) => server.pull(principal, input).pipe(Effect.mapError(wire)),
+    Changes: () => server.changes(principal).pipe(Stream.mapError(wire)),
+    Presence: (input) => server.presence(principal, input).pipe(Effect.mapError(wire))
   })
   const app = yield* RpcServer.toHttpEffect(Wire.EchoSyncRpcs).pipe(
     Effect.provide([handlers, RpcSerialization.layerNdjson])

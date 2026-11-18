@@ -562,8 +562,8 @@ behaviour adds or amends an item here in the same branch.
     existing tables, their constraints/indexes and the grant-event sequence, preserving rows,
     receipt/import identities, epoch/cursors and sequence ownership. A collision fails the
     entire migration rather than merging or silently hiding either dataset. Repeat runs and
-    fresh databases converge on the same canonical schema; only this migration and its fixture
-    may name source objects. Apps own their migration ledgers and metadata. Deploy new pins
+    fresh databases converge on the same canonical schema; only this migration (now part of the
+    first versioned step, item 45) and its fixture may name source objects. Apps own their migration ledgers and metadata. Deploy new pins
     with canonical profiles and transport paths, removing old request routes so stale bundles
     cannot write through a separate coordination namespace. The owner explicitly accepts a
     fresh browser namespace and abandoned old offline work for this noncritical-data cutover.
@@ -770,6 +770,34 @@ behaviour adds or amends an item here in the same branch.
     An epoch reset racing a request marks every `Sent` intent in it `Unknown`, as it did for one.
     Rejected: one request for the whole backlog (unbounded body) and keeping per-intent pulls.
 
+45. **The engine owns its schema version** (2026-11-18). An application deployed an engine pin
+    whose Pull reads a new table without re-running `migrate`; every Pull failed on a missing
+    table for 70 minutes while its health check passed, because apps listed engine table names
+    themselves. The migration is now an ordered list of released steps (`Migration.ts`); its
+    version is the number of steps, and `migrate` records each applied step's SQL in
+    `echosync_schema` in the same transaction as its DDL. Appending a step is the only way to
+    change engine DDL, so the version cannot be forgotten; a released step edited in place
+    makes `schemaStatus` report `diverged` on every database that applied it, and `migrate`
+    refuses to run over it. `schemaStatus` needs only the SQL client and reports `current`,
+    `pending` (behind, including never migrated), `ahead` or `diverged` with recorded and
+    expected versions. Construction still works on any database, because an application may
+    need a Server inside its own migrations; Execute, Pull, Changes and Presence refuse with
+    `SchemaIncompatible` while pending or diverged, re-checking until a process first sees
+    current or ahead. Over HTTP the refusal is a `ServerError` naming the status and versions,
+    which every client retries: a new wire error variant decodes as a defect in an open older
+    bundle and stops its sync until reload, so adding one needs a protocol bump. Ahead keeps serving: steps must be additive (new tables, defaulted or
+    nullable columns, indexes) so the previous release works during a rolling deploy and after
+    a rollback. `migrate` is meant for every startup: a current or ahead database costs one
+    read, with no DDL and no lock, so an older release never re-applies its DDL over a newer
+    schema and a no-op run never blocks writers; otherwise it re-reads the version under the
+    advisory lock and applies only the missing steps. Unversioned databases apply step 1,
+    which is the previous idempotent DDL; its scope-floor backfill now runs only when it
+    creates `echosync_scope_floors`, because re-running it raised floors of scopes created
+    later and forced their devices to bootstrap. Rejected: a hand-maintained version constant
+    (forgettable), checking table names (the stale lists this replaces), hashing step text
+    (the stored definition is as cheap to compare and readable), and running `migrate` from
+    `make` (construction precedes some apps' migrations).
+
 ## 3. Invariants catalogue
 
 The behaviours a rule-abiding engine promises, as a numbered list `INV-<AREA>-<n>`, one or
@@ -910,6 +938,11 @@ devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
 - **INV-SERVER-13:** Every server compacts change history older than its retention window
   (default 30 days) without operator action, per scope: a device whose cursor is at or past
   its scope's newest dropped revision keeps incremental catchup; older cursors bootstrap.
+- **INV-SERVER-14:** A server constructs on any database but refuses Execute, Pull, Changes
+  and Presence with `SchemaIncompatible` (a retryable `ServerError` over HTTP) while the recorded engine schema is behind its code or
+  records a changed released step, and serves a schema ahead of it. `migrate` upgrades an
+  unversioned database in place without changing data; on a current or ahead database it runs
+  no DDL and takes no engine or table lock, and concurrent runs apply each step once.
 - **INV-SYNC-1:** A browser's offline journal survives reload, reconnects over authenticated
   HTTP RPC to Postgres, converges with an independent device and retains authoritative rejection notices.
   Authentication failure in automatic Pull, Execute or Changes stops automatic retries without

@@ -90,6 +90,9 @@ name cites no existing `INV` id and is not a `Story`.
 ## Workflow
 
 - Work on a `ws/<name>` branch. Commit in logical steps.
+- Engine DDL changes only by appending a step to `src/server/Migration.ts` (design §2 item 45);
+  never edit, remove or reorder a released step. Steps stay additive, so the previous release
+  keeps serving during a rolling deploy and after a rollback.
 - A change to engine behaviour is a design change: update `docs/design.md` (a §2 decision with
   date, reason and rejected alternative, and the §3 catalogue) in the same branch.
 - Before merging, get an independent review of the diff (a reviewing subagent or a second

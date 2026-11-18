@@ -728,6 +728,8 @@ describe.skipIf(url === undefined)("Postgres server", () => {
             yield* sql`ALTER TABLE ${sql(`echosync_${suffix}`)} RENAME CONSTRAINT ${sql(conname)} TO ${sql(Str.replace(/^echosync_/, "echo_")(conname))}`
           yield* sql`ALTER TABLE ${sql(`echosync_${suffix}`)} RENAME TO ${sql(`echo_${suffix}`)}`
         }
+        // The released naming predates schema versioning.
+        yield* sql`DROP TABLE echosync_schema`
         yield* sql`ALTER INDEX echosync_events_batch RENAME TO echo_events_batch`
         yield* sql`ALTER SEQUENCE echosync_grant_events_position_seq RENAME TO echo_grant_events_position_seq`
         // Collision appears after earlier tables in migration order: every prior rename must roll back.
@@ -767,6 +769,99 @@ describe.skipIf(url === undefined)("Postgres server", () => {
         ])
         expect(yield* server.execute(alice, request("retained"))).toEqual(accepted)
         expect(yield* server.get(alice, Tag, TagId.make("retained"))).toMatchObject({ name: "retained" })
+      })
+    )
+  )
+
+  it.effect("INV-SERVER-14 a database behind the code refuses sync and migrate cannot lock a current one", () =>
+    scenario(
+      Effect.fnUntraced(function* (server, sql) {
+        const migrate = Server.migrate.pipe(Effect.provideService(SqlClient.SqlClient, sql))
+        const status = Server.schemaStatus.pipe(Effect.provideService(SqlClient.SqlClient, sql))
+        const pull = (s: Server.Server) => s.pull(alice, { epoch: null, cursors: {}, incremental: true })
+        const make = Server.make({ aggregates: [Tag, Note] })
+        const { expected } = yield* status
+        expect(yield* status).toEqual({ status: "current", recorded: expected, expected })
+        // Creates user:alice after change tracking began, so it has no floor row.
+        yield* server.execute(alice, request("kept"))
+        // The previous engine release: no recorded version and no grant floors.
+        yield* sql`DROP TABLE echosync_schema`
+        yield* sql`DROP TABLE echosync_grant_floors`
+        const data = sql`SELECT (SELECT to_jsonb(e) FROM echosync_engine e) AS engine,
+          (SELECT jsonb_agg(to_jsonb(t) ORDER BY t.scope) FROM echosync_scopes t) AS scopes,
+          (SELECT coalesce(jsonb_agg(to_jsonb(t) ORDER BY t.scope),'[]') FROM echosync_scope_floors t) AS floors,
+          (SELECT jsonb_agg(to_jsonb(t) ORDER BY t.id) FROM echosync_streams t) AS streams,
+          (SELECT jsonb_agg(to_jsonb(t) ORDER BY t.id) FROM echosync_scope_changes t) AS changes`
+        const before = yield* data
+        const behind = yield* make
+        const refusal = new Server.SchemaIncompatible({ status: "pending", recorded: 0, expected })
+        expect(yield* status).toEqual({ status: "pending", recorded: 0, expected })
+        expect(yield* Effect.flip(pull(behind))).toEqual(refusal)
+        expect(yield* Effect.flip(behind.pull(alice, { epoch: null, cursors: {} }))).toEqual(refusal)
+        expect(yield* Effect.flip(behind.execute(alice, request("blocked")))).toEqual(refusal)
+        expect(yield* Effect.flip(Stream.runHead(behind.changes(alice)))).toEqual(refusal)
+        expect(
+          yield* Effect.flip(
+            behind.presence(alice, { connectionId: "c", room: "user:alice", clientId: "tab", state: null })
+          )
+        ).toEqual(refusal)
+        yield* migrate
+        expect(yield* status).toEqual({ status: "current", recorded: expected, expected })
+        // Upgrading in place changes no data, including no new floor for a tracked scope.
+        expect(yield* data).toEqual(before)
+        expect(entries(yield* pull(behind))).toMatchObject([{ aggregate: "Tag", id: "kept" }])
+        expect((yield* behind.execute(alice, request("after"))).receipts).toMatchObject([{ _tag: "Accepted" }])
+
+        // DROP/CREATE TRIGGER gives the trigger a new oid; CREATE OR REPLACE rewrites the function row.
+        const ddl = sql`SELECT t.oid::text AS trigger,p.xmin::text AS function FROM pg_trigger t JOIN pg_proc p ON p.oid=t.tgfoid WHERE t.tgname='echosync_track_stream'`
+        const objects = yield* ddl
+        // A writer in progress holds the engine row and a write lock on streams, and a newer
+        // release's migration holds the migration lock.
+        const locked = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        const writer = yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              yield* sql`SELECT 1 FROM echosync_engine FOR UPDATE`
+              yield* sql`UPDATE echosync_streams SET seq=seq WHERE false`
+              yield* sql`SELECT pg_advisory_xact_lock(hashtextextended('echosync:migrate:' || current_schema(),0))`
+              yield* Deferred.succeed(locked, undefined)
+              yield* Deferred.await(release)
+            })
+          )
+          .pipe(Effect.forkScoped)
+        yield* Deferred.await(locked)
+        const concurrent = Effect.all([migrate, migrate], { concurrency: 2 })
+        expect((yield* Effect.result(TestClock.withLive(Effect.timeout(concurrent, "3 seconds"))))._tag).toBe("Success")
+        yield* Deferred.succeed(release, undefined)
+        yield* Fiber.join(writer)
+        expect(yield* ddl).toEqual(objects)
+
+        // After a rollback the older code serves and never re-applies its DDL over the newer schema.
+        yield* sql`INSERT INTO echosync_schema(step,definition) VALUES(${expected + 1},'future')`
+        expect(yield* status).toEqual({ status: "ahead", recorded: expected + 1, expected })
+        yield* migrate
+        expect(yield* ddl).toEqual(objects)
+        expect(entries(yield* pull(yield* make))).toHaveLength(2)
+
+        // A released step edited in place is neither served nor migrated over.
+        yield* sql`DELETE FROM echosync_schema WHERE step>${expected}`
+        yield* sql`UPDATE echosync_schema SET definition=definition || ' ' WHERE step=1`
+        const diverged = new Server.SchemaIncompatible({ status: "diverged", recorded: expected, expected })
+        expect(yield* status).toEqual({ status: "diverged", recorded: expected, expected })
+        expect(yield* Effect.flip(migrate)).toEqual(diverged)
+        expect(yield* Effect.flip(pull(yield* make))).toEqual(diverged)
+
+        // An empty database constructs a server; two instances then migrate it at once.
+        const schema = (yield* sql<{ readonly name: string }>`SELECT current_schema() AS name`)[0]?.name ?? ""
+        yield* sql`DROP SCHEMA ${sql(schema)} CASCADE`
+        yield* sql`CREATE SCHEMA ${sql(schema)}`
+        const fresh = yield* make
+        expect(yield* status).toEqual({ status: "pending", recorded: 0, expected })
+        expect(yield* Effect.flip(pull(fresh))).toEqual(refusal)
+        yield* Effect.all([migrate, migrate], { concurrency: 2 })
+        expect(yield* status).toEqual({ status: "current", recorded: expected, expected })
+        expect(entries(yield* pull(fresh))).toEqual([])
       })
     )
   )
