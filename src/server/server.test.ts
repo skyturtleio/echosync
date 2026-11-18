@@ -516,6 +516,34 @@ describe.skipIf(url === undefined)("Postgres server", () => {
     60000
   )
 
+  it.effect("INV-SERVER-13 retention drops only expired history and keeps recent devices incremental", () =>
+    scenario(
+      Effect.fnUntraced(function* (server, sql) {
+        yield* server.execute(alice, request("old-alice"))
+        const synced = yield* server.pull(alice, { epoch: null, cursors: {}, incremental: true })
+        yield* server.execute(bob, request("old-bob", "old-bob", "old-bob"))
+        // Everything so far left the 30-day window; alice's new write is recent.
+        yield* sql`UPDATE echosync_scope_changes SET at=now()-interval '31 days'`
+        yield* server.execute(alice, request("new-alice"))
+        yield* TestClock.adjust("5 minutes")
+        while ((yield* sql`SELECT 1 FROM echosync_scope_changes`).length > 1)
+          yield* TestClock.withLive(Effect.sleep("20 millis"))
+        expect(yield* sql`SELECT 1 FROM echosync_scope_changes`).toHaveLength(1)
+        // A device past its own scope's expired history keeps incremental catchup, even though
+        // another scope's expired history is newer; a global cutoff would reset it.
+        const recent = yield* server.pull(alice, { epoch: null, cursors: cursors(synced), incremental: true })
+        expect(Option.getOrUndefined(Arr.findFirst(recent.scopes, (x) => x.scope === "user:alice"))).toMatchObject({
+          reset: false,
+          entries: [{ _tag: "Upsert", id: "new-alice" }]
+        })
+        // A cursor older than the dropped history bootstraps instead of missing changes.
+        const stale = yield* server.pull(alice, { epoch: null, cursors: { "user:alice": 0 }, incremental: true })
+        expect(Option.getOrUndefined(Arr.findFirst(stale.scopes, (x) => x.scope === "user:alice"))?.reset).toBe(true)
+        expect(entries(stale)).toHaveLength(2)
+      })
+    )
+  )
+
   it.effect(
     "INV-SCHEMA-4 deployment cannot rewrite historical facts or reinterpret old requests during projection rebuild",
     () =>

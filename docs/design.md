@@ -723,6 +723,23 @@ behaviour adds or amends an item here in the same branch.
     default would silently let directly seeded grants replay history) and replaying history on
     grant (item 3: a reader who gains a scope receives snapshots).
 
+42. **Servers compact expired change history themselves** (2026-11-18). Nothing called
+    `compactScopes`, so `echosync_scope_changes` grew with every write forever. Each change row
+    now records `at`; rows that predate the column count from the migration. `Server.make`
+    forks a scoped fiber that, five minutes after start (so frequently redeployed processes
+    still run it) and then daily, finds each scope's newest revision older than
+    `Options.changeRetention` (default 30 days), raises that scope's floor to it and deletes the
+    scope's rows at or below it. Deletion is by revision, so imperfect `at` ordering only keeps
+    history longer. A device whose cursor is at or past its scope's floor keeps incremental
+    catchup; one that last synced earlier downloads a full snapshot of each scope that changed
+    between its last sync and the start of the window. Every process runs it under the engine
+    lock, so concurrent runs are idempotent; a failure reports through `onFailure` and retries
+    the next day. Each run scans the table, about 0.35 s per 750k retained rows; revisit with a
+    narrower delete only at tens of millions of rows. Events and receipts are unaffected. Rejected: a global revision cutoff
+    (the operator `compactScopes` semantics), which resets every device whose scope last
+    changed before the cutoff even when no history it needs was dropped, and an
+    application-scheduled job (every app would have to remember it).
+
 ## 3. Invariants catalogue
 
 The behaviours a rule-abiding engine promises, as a numbered list `INV-<AREA>-<n>`, one or
@@ -856,6 +873,9 @@ devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
 - **INV-SERVER-12:** Structured operation logs distinguish Pull page work from Changes
   connection lifetime without payloads, identifiers or raw failures, preserving request log
   annotations and operation outcomes.
+- **INV-SERVER-13:** Every server compacts change history older than its retention window
+  (default 30 days) without operator action, per scope: a device whose cursor is at or past
+  its scope's newest dropped revision keeps incremental catchup; older cursors bootstrap.
 - **INV-SYNC-1:** A browser's offline journal survives reload, reconnects over authenticated
   HTTP RPC to Postgres, converges with an independent device and retains authoritative rejection notices.
   Authentication failure in automatic Pull, Execute or Changes stops automatic retries without

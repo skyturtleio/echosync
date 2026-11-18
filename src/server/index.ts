@@ -2,6 +2,7 @@ import * as PgClient from "@effect/sql-pg/PgClient"
 import * as Arr from "effect/Array"
 import * as Cause from "effect/Cause"
 import * as DateTime from "effect/DateTime"
+import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Equal from "effect/Equal"
 import * as Option from "effect/Option"
@@ -139,6 +140,9 @@ export interface Options {
   readonly actions?: ReadonlyArray<Action.Action>
   readonly onFailure?: (operation: string, cause: Cause.Cause<unknown>) => Effect.Effect<void>
   readonly onRejected?: (outcome: RejectedOutcome) => Effect.Effect<void>
+  /** How long incremental-catchup history is kept (default 30 days). A device that last synced
+   * earlier downloads a full snapshot of each scope that changed before the window began. */
+  readonly changeRetention?: Duration.Input
 }
 /** Best-effort, post-commit diagnostic; never called for receipt replay or transaction retries. */
 export interface RejectedOutcome {
@@ -797,6 +801,23 @@ export const make = Effect.fn("EchoSync.Server.make")(function* (
   const compactScopes = (through: number) =>
     transaction(Sync.compact(through)).pipe(Effect.provideService(SqlClient.SqlClient, sql), protect("compactScopes"))
   const changes = yield* Changes.make(sql)
+  const retention = Duration.toMillis(options.changeRetention ?? "30 days")
+  // Every process runs this; it is idempotent under the engine lock. Failures report through
+  // onFailure and the next day retries, so maintenance never stops the server.
+  // Soon after start, so processes that redeploy often still compact; then daily.
+  yield* Effect.sleep("5 minutes").pipe(
+    Effect.andThen(
+      Effect.forever(
+        transaction(Sync.expire(retention)).pipe(
+          Effect.provideService(SqlClient.SqlClient, sql),
+          protect("expireHistory"),
+          Effect.ignore,
+          Effect.andThen(Effect.sleep("24 hours"))
+        )
+      )
+    ),
+    Effect.forkScoped
+  )
   return {
     execute: (principal, request) =>
       Telemetry.measure("Execute", execute(principal, request), null, (reply) => ({

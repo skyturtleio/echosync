@@ -22,6 +22,9 @@ export const migrate = Effect.gen(function* () {
   yield* sql`CREATE TABLE IF NOT EXISTS echosync_scope_changes(scope text NOT NULL, revision bigint NOT NULL, aggregate text NOT NULL,id text NOT NULL,PRIMARY KEY(scope,revision,aggregate,id))`
   // Engine writers hold the singleton lock and advance it once after all stream mutations.
   // Store identities, not historical state: catchup returns only the authorized current view.
+  // Age for retention only chooses each scope's floor; deletion is by revision at or below it,
+  // so imperfect ordering (rows that predate the column) keeps history longer, never loses it.
+  yield* sql`ALTER TABLE echosync_scope_changes ADD COLUMN IF NOT EXISTS at timestamptz NOT NULL DEFAULT clock_timestamp()`
   yield* sql`CREATE OR REPLACE FUNCTION echosync_track_stream() RETURNS trigger LANGUAGE plpgsql AS $body$
     DECLARE revision bigint;
     BEGIN
@@ -48,6 +51,18 @@ export const compact = Effect.fnUntraced(function* (through: number) {
   yield* Schema.decodeEffect(Wire.Position)(through)
   yield* sql`INSERT INTO echosync_scope_floors(scope,cursor)
     SELECT scope,least(cursor,${through}) FROM echosync_scopes
+    ON CONFLICT(scope) DO UPDATE SET cursor=greatest(echosync_scope_floors.cursor,EXCLUDED.cursor)`
+  yield* sql`DELETE FROM echosync_scope_changes c USING echosync_scope_floors f WHERE c.scope=f.scope AND c.revision<=f.cursor`
+})
+
+/** Must run inside the serialized engine transaction. Drops each scope's change history older
+ * than the retention window and raises that scope's floor only to the newest dropped revision,
+ * so a device whose cursor is at or past it keeps incremental catchup. */
+export const expire = Effect.fnUntraced(function* (retentionMillis: number) {
+  const sql = yield* SqlClient.SqlClient
+  yield* sql`INSERT INTO echosync_scope_floors(scope,cursor)
+    SELECT scope,max(revision) FROM echosync_scope_changes
+    WHERE at <= clock_timestamp() - ${retentionMillis} * interval '1 millisecond' GROUP BY scope
     ON CONFLICT(scope) DO UPDATE SET cursor=greatest(echosync_scope_floors.cursor,EXCLUDED.cursor)`
   yield* sql`DELETE FROM echosync_scope_changes c USING echosync_scope_floors f WHERE c.scope=f.scope AND c.revision<=f.cursor`
 })
