@@ -72,11 +72,11 @@ export const expire = Effect.fnUntraced(function* (retentionMillis: number) {
  * stay far below the client's 64 Mi frame limit. */
 const pageSize = 8192
 
-/** Materialize a fixed view before paging; no SQL transaction or connection spans requests. */
+/** A catchup that fits one page replies directly and writes nothing. A larger one materializes a
+ * fixed view before paging; no SQL transaction or connection spans requests. */
 export const pull = Effect.fnUntraced(function* (principal: Principal, request: Wire.PullRequest) {
   const sql = yield* PgClient.PgClient
-  if (request.continuation === undefined) yield* sql`DELETE FROM echosync_pull_sessions WHERE expires_at<=now()`
-  return yield* sql.withTransaction(
+  const reply = yield* sql.withTransaction(
     Effect.gen(function* () {
       yield* sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ`
       const engines = yield* sql<{
@@ -117,6 +117,37 @@ export const pull = Effect.fnUntraced(function* (principal: Principal, request: 
             entries: []
           }))
         }
+        // Ranked entries of one scope, in the order staging and direct replies both use.
+        const source = (scope: (typeof response.scopes)[number]) =>
+          scope.reset
+            ? sql`SELECT row_number() OVER(ORDER BY aggregate,id) AS rank,
+                jsonb_build_object('_tag','Upsert','aggregate',aggregate,'id',id,'seq',seq,'state',state) AS entry
+                FROM echosync_streams WHERE scope=${scope.scope}`
+            : sql`SELECT row_number() OVER(ORDER BY keys.aggregate,keys.id) AS rank,
+            CASE WHEN s.id IS NULL THEN jsonb_build_object('_tag','Gone','aggregate',keys.aggregate,'id',keys.id)
+            ELSE jsonb_build_object('_tag','Upsert','aggregate',s.aggregate,'id',s.id,'seq',s.seq,'state',s.state) END AS entry
+          FROM (
+            SELECT DISTINCT aggregate,id FROM echosync_scope_changes WHERE scope=${scope.scope} AND revision>${request.cursors[scope.scope] ?? 0} AND revision<=${scope.cursor}
+          ) keys LEFT JOIN echosync_streams s ON s.aggregate=keys.aggregate AND s.id=keys.id AND s.scope=${scope.scope}`
+        // Most catchups fit one page: answer from this snapshot and write nothing. Staging only
+        // exists so later pages share one view, so a single-page reply needs none.
+        const direct = new Map<string, Array<typeof Wire.Entry.Type>>()
+        let remaining = pageSize
+        for (const scope of response.scopes) {
+          const rows = yield* sql<{
+            readonly entry: unknown
+          }>`SELECT entry FROM (${source(scope)}) ranked ORDER BY rank LIMIT ${remaining + 1}`
+          remaining -= rows.length
+          if (remaining < 0) break
+          const values: Array<typeof Wire.Entry.Type> = []
+          for (const row of rows) values.push(yield* Schema.decodeUnknownEffect(Wire.Entry)(row.entry))
+          direct.set(scope.scope, values)
+        }
+        if (remaining >= 0)
+          return {
+            ...response,
+            scopes: Arr.map(response.scopes, (scope) => ({ ...scope, entries: direct.get(scope.scope) ?? [] }))
+          }
         const sessions = yield* sql<{
           readonly id: string
         }>`INSERT INTO echosync_pull_sessions(principal,epoch,grant_position,generation,response) VALUES(${principal},${engine.epoch},${authorization},${engine.generation},${sql.json(response)}) RETURNING id::text`
@@ -124,19 +155,9 @@ export const pull = Effect.fnUntraced(function* (principal: Principal, request: 
         if (id === undefined) return yield* new Wire.ServerError({ message: "Cannot stage Pull" })
         let offset = 0
         for (const scope of response.scopes) {
-          const source = scope.reset
-            ? sql`SELECT ${id}::uuid,${offset}+row_number() OVER(ORDER BY aggregate,id),${scope.scope},
-                jsonb_build_object('_tag','Upsert','aggregate',aggregate,'id',id,'seq',seq,'state',state)
-                FROM echosync_streams WHERE scope=${scope.scope}`
-            : sql`
-          SELECT ${id}::uuid,${offset}+row_number() OVER(ORDER BY keys.aggregate,keys.id),${scope.scope},
-            CASE WHEN s.id IS NULL THEN jsonb_build_object('_tag','Gone','aggregate',keys.aggregate,'id',keys.id)
-            ELSE jsonb_build_object('_tag','Upsert','aggregate',s.aggregate,'id',s.id,'seq',s.seq,'state',s.state) END
-          FROM (
-            SELECT DISTINCT aggregate,id FROM echosync_scope_changes WHERE scope=${scope.scope} AND revision>${request.cursors[scope.scope] ?? 0} AND revision<=${scope.cursor}
-          ) keys LEFT JOIN echosync_streams s ON s.aggregate=keys.aggregate AND s.id=keys.id AND s.scope=${scope.scope}`
           const inserted = yield* sql<{ readonly count: string }>`WITH inserted AS (
-            INSERT INTO echosync_pull_entries(session,position,scope,entry) ${source} RETURNING 1
+            INSERT INTO echosync_pull_entries(session,position,scope,entry)
+            SELECT ${id}::uuid,${offset}+rank,${scope.scope},entry FROM (${source(scope)}) ranked RETURNING 1
           ) SELECT count(*)::text AS count FROM inserted`
           offset += Number(inserted[0]?.count ?? 0)
         }
@@ -169,4 +190,10 @@ export const pull = Effect.fnUntraced(function* (principal: Principal, request: 
       }
     })
   )
+  // Only stagers create sessions, so they clean up expired ones. In autocommit, outside the
+  // REPEATABLE READ snapshot: concurrent stagers then wait and delete nothing instead of failing
+  // with a serialization error.
+  if (request.continuation === undefined && reply.page !== undefined)
+    yield* sql`DELETE FROM echosync_pull_sessions WHERE expires_at<=now()`
+  return reply
 })

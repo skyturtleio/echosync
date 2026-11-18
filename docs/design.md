@@ -575,7 +575,8 @@ behaviour adds or amends an item here in the same branch.
     and moves retain Gone entries. Compaction advances a durable per-scope floor; migration
     initializes it at existing cursors without changing epochs, receipts or streams. Initial,
     future and compacted cursors receive snapshots. Legacy Pull remains snapshot-only.
-    Opted-in catchups materialize a fixed authorized view in expiring server staging tables,
+    Opted-in catchups larger than one page (item 43) materialize a fixed authorized view in
+    expiring server staging tables,
     page its entries (8192 per page; raised from 2048 on 2026-11-18 because page count, not
     payload, dominated catalog bootstraps: 42 round trips for 84,780 rows, now 11), and recheck
     the principal, epoch and grant generation on every page.
@@ -742,6 +743,19 @@ behaviour adds or amends an item here in the same branch.
     changed before the cutoff even when no history it needs was dropped, and an
     application-scheduled job (every app would have to remember it).
 
+43. **Single-page catchups are not staged** (2026-11-18). Staging exists so that every page of
+    a multi-page catchup comes from one snapshot. Every Pull nevertheless wrote a session row and
+    copied each entry before reading it back, including empty steady-state pulls, which are the
+    most frequent request; production showed a 16.6 MB `echosync_pull_entries` table holding no
+    live rows. A first Pull now reads each scope's ranked entries from its REPEATABLE READ
+    snapshot with a limit of one page plus one. When everything fits, it replies with the
+    entries and no `page` field (the shape clients already accept) and writes nothing. Otherwise
+    it stages as before, after a wasted direct read of at most one page plus one. Only a Pull
+    that staged removes expired sessions, after its transaction commits: inside the REPEATABLE
+    READ snapshot, two concurrent stagers deleting the same rows fail with a serialization
+    error. Continuations, expiry and the grant/generation checks are unchanged. Rejected:
+    staging only the overflow (two code paths for one view) and a byte-bounded first page.
+
 ## 3. Invariants catalogue
 
 The behaviours a rule-abiding engine promises, as a numbered list `INV-<AREA>-<n>`, one or
@@ -759,7 +773,8 @@ devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
   across bounded pages and intervening commits. Retries replay the same staged page; expired,
   compacted or missing cursors fall back safely. Deletes, moves and grant transitions cannot
   leak historical access or advance receipt coverage before atomic installation. A new grant
-  bootstraps only its own principal; members whose access is unchanged keep their cursors. A steady-state
+  bootstraps only its own principal; members whose access is unchanged keep their cursors.
+  A catchup that fits one page replies from its own snapshot without writing staging rows. A steady-state
   row change persists only that record and replica metadata, with atomic abort/reopen recovery;
   unchanged replicas write no records. Projection rebuilds invalidate old staged pages and
   force snapshot fallback. Old HTTP protocol clients cannot execute commands.

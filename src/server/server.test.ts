@@ -373,11 +373,15 @@ describe.skipIf(url === undefined)("Postgres server", () => {
           expect(Option.getOrUndefined(Arr.findFirst(all, (entry) => entry.id === "row-2000"))).toMatchObject({
             state: { removed: false }
           })
+          const staged = yield* sql`SELECT id FROM echosync_pull_sessions`
           const delta = yield* server.pull(alice, {
             epoch: initial.epoch,
             cursors: cursors(initial),
             incremental: true
           })
+          // A catchup that fits one page replies from its snapshot and stages nothing.
+          expect(delta.page).toBeUndefined()
+          expect(yield* sql`SELECT id FROM echosync_pull_sessions`).toEqual(staged)
           expect(entries(delta)).toEqual([
             {
               _tag: "Upsert",
@@ -485,17 +489,23 @@ describe.skipIf(url === undefined)("Postgres server", () => {
           expect(
             Option.getOrUndefined(Arr.findFirst(removed.scopes, (s) => s.scope === "catalog:deletes"))?.entries
           ).toEqual([{ _tag: "Gone", aggregate: "Tag", id: "deleted" }])
+          const bootstrap = yield* server.pull(alice, { epoch: null, cursors: {}, incremental: true })
+          expect(bootstrap.page?.next).toBe(8192)
+          const continuation = {
+            epoch: removed.epoch,
+            cursors: {},
+            incremental: true,
+            continuation: { id: bootstrap.page?.id ?? "", offset: 8192 }
+          }
+          expect(entries(yield* server.pull(alice, continuation)).length).toBeGreaterThan(0)
           yield* sql`UPDATE echosync_pull_sessions SET expires_at=now()-interval '1 second'`
-          expect(
-            (yield* Effect.result(
-              server.pull(alice, {
-                epoch: removed.epoch,
-                cursors: {},
-                incremental: true,
-                continuation: { id: removed.page?.id ?? "", offset: 0 }
-              })
-            ))._tag
-          ).toBe("Failure")
+          expect((yield* Effect.result(server.pull(alice, continuation)))._tag).toBe("Failure")
+          // Concurrent catchups that both stage while expired sessions remain must both succeed.
+          const restarts = yield* Effect.all(
+            Arr.makeBy(4, () => server.pull(alice, { epoch: null, cursors: {}, incremental: true })),
+            { concurrency: "unbounded" }
+          )
+          expect(Arr.map(restarts, (r) => r.page?.next)).toEqual([8192, 8192, 8192, 8192])
           expect(
             Option.getOrUndefined(
               Arr.findFirst(
@@ -559,23 +569,32 @@ describe.skipIf(url === undefined)("Postgres server", () => {
           expect(yield* old.get(alice, LegacyTally, "one")).toEqual({ value: 15, scope: "user:alice" })
           const facts = yield* sql`SELECT * FROM echosync_events ORDER BY seq`
           const receipts = yield* sql`SELECT * FROM echosync_receipts ORDER BY batch_id`
+          // A catalog larger than one page, so the catchup below stages a session to invalidate.
+          yield* (yield* Server.make({ aggregates: [Tag] })).ingestCatalog({
+            scope: "catalog:bulk",
+            release: "one",
+            rows: Arr.makeBy(8193, (n) => ({
+              aggregate: "Tag",
+              id: `bulk-${n}`,
+              state: { name: `bulk-${n}`, scope: "catalog:bulk", removed: false }
+            }))
+          })
           const before = yield* current.pull(alice, { epoch: null, cursors: {} })
           const staged = yield* current.pull(alice, { epoch: before.epoch, cursors: {}, incremental: true })
+          expect(staged.page?.next).toBe(8192)
+          const continuation = {
+            epoch: before.epoch,
+            cursors: {},
+            incremental: true,
+            continuation: { id: staged.page?.id ?? "", offset: 8192 }
+          }
+          expect(entries(yield* current.pull(alice, continuation)).length).toBeGreaterThan(0)
           const projected = yield* Server.make({ aggregates: [ProjectedTally] })
           expect(yield* projected.get(alice, ProjectedTally, "one").pipe(Effect.flip)).toMatchObject({
             _tag: "ServerError"
           })
           expect(yield* projected.rebuildProjections([ProjectedTally])).toBe(1)
-          expect(
-            (yield* Effect.result(
-              projected.pull(alice, {
-                epoch: before.epoch,
-                cursors: {},
-                incremental: true,
-                continuation: { id: staged.page?.id ?? "", offset: 0 }
-              })
-            ))._tag
-          ).toBe("Failure")
+          expect((yield* Effect.result(projected.pull(alice, continuation)))._tag).toBe("Failure")
           expect(yield* projected.get(alice, ProjectedTally, "one")).toEqual({ value: 15, scope: "user:alice" })
           expect(yield* sql`SELECT * FROM echosync_events ORDER BY seq`).toEqual(facts)
           expect(yield* sql`SELECT * FROM echosync_receipts ORDER BY batch_id`).toEqual(receipts)
@@ -584,7 +603,7 @@ describe.skipIf(url === undefined)("Postgres server", () => {
             cursors: cursors(before),
             incremental: true
           })
-          expect(after.scopes[0]?.reset).toBe(true)
+          expect(Option.getOrUndefined(Arr.findFirst(after.scopes, (s) => s.scope === "user:alice"))?.reset).toBe(true)
           expect(entries(after)).toEqual([
             {
               _tag: "Upsert",
@@ -607,7 +626,7 @@ describe.skipIf(url === undefined)("Postgres server", () => {
           yield* sql`UPDATE echosync_events SET seq=3 WHERE seq=9`
           // A later invalid stream must roll back a genuinely changed earlier projection and its cursors.
           yield* sql`UPDATE echosync_streams SET state='{"stale":true}' WHERE id='one'`
-          const staleRows = yield* sql`SELECT * FROM echosync_streams`
+          const staleRows = yield* sql`SELECT * FROM echosync_streams WHERE id='one'`
           const engineBefore = yield* sql`SELECT * FROM echosync_engine`
           const scopesBefore = yield* sql`SELECT * FROM echosync_scopes`
           yield* sql`INSERT INTO echosync_streams VALUES ('Tally','z-catalog','catalog:tally',1,'null')`
