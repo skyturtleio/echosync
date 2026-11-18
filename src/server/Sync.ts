@@ -10,6 +10,9 @@ import * as Wire from "../protocol.ts"
 export const migrate = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient
   yield* sql`UPDATE echosync_engine SET cursor=cursor`
+  // After the engine lock, like every writer: locking streams first could deadlock a live writer.
+  // Pattern ops serve both scope equality and the collation-independent 'catalog:%' prefix.
+  yield* sql`CREATE INDEX IF NOT EXISTS echosync_streams_scope ON echosync_streams(scope text_pattern_ops,aggregate,id)`
   yield* sql`ALTER TABLE echosync_engine ADD COLUMN IF NOT EXISTS sync_generation bigint NOT NULL DEFAULT 0`
   yield* sql`CREATE TABLE IF NOT EXISTS echosync_scope_floors(scope text PRIMARY KEY, cursor bigint NOT NULL)`
   yield* sql`INSERT INTO echosync_scope_floors SELECT scope,cursor FROM echosync_scopes ON CONFLICT DO NOTHING`

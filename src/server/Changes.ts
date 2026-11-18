@@ -3,6 +3,7 @@ import * as Arr from "effect/Array"
 import * as Cause from "effect/Cause"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
+import * as Equal from "effect/Equal"
 import * as Fiber from "effect/Fiber"
 import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
@@ -88,7 +89,7 @@ export const make = Effect.fnUntraced(function* (sql: PgClient.PgClient) {
           yield* sql`SELECT scope,principal,role FROM echosync_grants`
         )
         const members = yield* Schema.decodeUnknownEffect(Schema.Array(Wire.PresenceMember))(
-          yield* sql`SELECT p.room,c.principal,p.client_id AS "clientId",p.state FROM echosync_presence p JOIN echosync_connections c ON c.id=p.connection_id WHERE c.expires_at>now() AND p.expires_at>now()`
+          yield* sql`SELECT p.room,c.principal,p.client_id AS "clientId",p.state FROM echosync_presence p JOIN echosync_connections c ON c.id=p.connection_id WHERE c.expires_at>now() AND p.expires_at>now() ORDER BY p.room,c.principal,p.client_id,p.connection_id`
         )
         const engine = yield* sql<{ readonly epoch: string }>`SELECT epoch FROM echosync_engine`
         const epoch = engine[0]?.epoch
@@ -123,8 +124,12 @@ export const make = Effect.fnUntraced(function* (sql: PgClient.PgClient) {
         presence = Arr.filter(members, (member) => readable(subscriber.principal, member.room))
         visible.set(subscriber.principal, presence)
       }
-      subscriber.poke ||= dirtyAll || Arr.some([...dirtyScopes], (scope) => readable(subscriber.principal, scope))
-      subscriber.frame = { _tag: "Keepalive", epoch: snapshot.epoch, connectionId: id, presence }
+      const poke = dirtyAll || Arr.some([...dirtyScopes], (scope) => readable(subscriber.principal, scope))
+      const frame: Wire.Change = { _tag: "Keepalive", epoch: snapshot.epoch, connectionId: id, presence }
+      // Unrelated writes and presence elsewhere send nothing; maintenance still keeps the stream alive.
+      if (!poke && !renew && Equal.equals(subscriber.frame, frame)) continue
+      subscriber.poke ||= poke
+      subscriber.frame = frame
       Queue.offerUnsafe(subscriber.wake, undefined)
     }
   }).pipe(Effect.timeout("15 seconds"))

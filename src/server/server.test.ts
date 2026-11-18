@@ -4,6 +4,7 @@ import * as Arr from "effect/Array"
 import * as Cause from "effect/Cause"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
+import * as Equal from "effect/Equal"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
@@ -1227,12 +1228,13 @@ describe.skipIf(url === undefined)("Postgres server", () => {
   it.effect("INV-SERVER-2 concurrent unique claims and duplicate deliveries have one authoritative outcome", () =>
     scenario(
       Effect.fnUntraced(function* (server, sql) {
+        // Queued writers must read each other's commits, not a snapshot from before their lock wait.
         const results = yield* Effect.all(
-          [server.execute(alice, request("a", "a", "unique")), server.execute(alice, request("b", "b", "unique"))],
+          Arr.makeBy(8, (i) => server.execute(alice, request(`claim-${i}`, `claim-${i}`, "unique"))),
           { concurrency: "unbounded" }
         )
         expect(Arr.filter(results, (r) => r.receipts[0]?._tag === "Accepted")).toHaveLength(1)
-        expect(Arr.filter(results, (r) => r.receipts[0]?._tag === "Rejected")).toHaveLength(1)
+        expect(Arr.filter(results, (r) => r.receipts[0]?._tag === "Rejected")).toHaveLength(7)
         const repeated = yield* Effect.all(
           Arr.makeBy(4, () => server.execute(alice, request("same"))),
           { concurrency: "unbounded" }
@@ -1259,7 +1261,18 @@ describe.skipIf(url === undefined)("Postgres server", () => {
         })
         expect(inBatch.receipts[0]).toMatchObject({ _tag: "Rejected", rejection: { _tag: "DuplicateName" } })
         expect(yield* sql`SELECT * FROM echosync_events`).toHaveLength(2)
-      })
+        // Independent writers queue on the engine lock; a snapshot-and-retry lock caps a burst at
+        // its retry count plus one and fails the rest.
+        const burst = yield* Effect.all(
+          Arr.makeBy(64, (i) =>
+            server.execute(Principal.make(`writer-${i}`), request(`burst-${i}`, `burst-${i}`, `burst-${i}`))
+          ),
+          { concurrency: "unbounded" }
+        )
+        expect(Arr.filter(burst, (r) => r.receipts[0]?._tag === "Accepted")).toHaveLength(64)
+        expect(yield* sql`SELECT * FROM echosync_events`).toHaveLength(66)
+      }),
+      70
     )
   )
 
@@ -1484,7 +1497,46 @@ describe.skipIf(url === undefined)("Postgres server", () => {
         })
         expect(yield* sql`SELECT * FROM echosync_events`).toHaveLength(1)
         expect(yield* sql`SELECT * FROM echosync_catalog_releases`).toHaveLength(1)
-        // A duplicate id fails during insertion, after DELETE; the previous snapshot must survive rollback.
+        // A new release sends incremental readers only its changed and removed rows; unchanged
+        // rows keep their sequence. Replacing the whole scope would resend every row.
+        const tagCursors = cursors(before)
+        yield* server.ingestCatalog({
+          ...catalog,
+          release: "diff",
+          rows: [
+            { aggregate: "Tag", id: "two", state: { name: "two", scope: "catalog:tags", removed: false } },
+            { aggregate: "Tag", id: "three", state: { name: "three", scope: "catalog:tags", removed: false } }
+          ]
+        })
+        const diff = yield* server.pull(alice, { epoch: before.epoch, cursors: tagCursors, incremental: true })
+        expect(Option.getOrUndefined(Arr.findFirst(diff.scopes, (s) => s.scope === catalog.scope))).toMatchObject({
+          reset: false,
+          entries: [
+            { _tag: "Gone", aggregate: "Tag", id: "one" },
+            { _tag: "Upsert", aggregate: "Tag", id: "three", seq: 1 }
+          ]
+        })
+        yield* server.ingestCatalog({
+          ...catalog,
+          release: "renamed",
+          rows: [
+            { aggregate: "Tag", id: "two", state: { name: "second", scope: "catalog:tags", removed: false } },
+            { aggregate: "Tag", id: "three", state: { name: "three", scope: "catalog:tags", removed: false } }
+          ]
+        })
+        const renamed = yield* server.pull(alice, { epoch: before.epoch, cursors: cursors(diff), incremental: true })
+        expect(Option.getOrUndefined(Arr.findFirst(renamed.scopes, (s) => s.scope === catalog.scope))).toMatchObject({
+          entries: [{ _tag: "Upsert", aggregate: "Tag", id: "two", seq: 2, state: { name: "second" } }]
+        })
+        yield* server.ingestCatalog({ ...catalog, release: "restored" })
+        const restored = Option.getOrUndefined(
+          Arr.findFirst(
+            (yield* server.pull(alice, { epoch: null, cursors: {} })).scopes,
+            (s) => s.scope === catalog.scope
+          )
+        )
+        expect(restored?.entries).toHaveLength(2)
+        // A duplicate id fails before replacement; the previous snapshot must survive rollback.
         const duplicate = {
           aggregate: "Tag",
           id: "duplicate",
@@ -1502,8 +1554,8 @@ describe.skipIf(url === undefined)("Postgres server", () => {
               (s) => s.scope === catalog.scope
             )
           )
-        ).toEqual(Option.getOrUndefined(Arr.findFirst(before.scopes, (s) => s.scope === catalog.scope)))
-        expect(yield* sql`SELECT * FROM echosync_catalog_releases`).toHaveLength(1)
+        ).toEqual(restored)
+        expect(yield* sql`SELECT * FROM echosync_catalog_releases`).toHaveLength(4)
         yield* server.ingestCatalog({ ...catalog, release: "empty", rows: [] })
         const emptied = yield* server.pull(alice, { epoch: before.epoch, cursors: cursors(before) })
         expect(Option.getOrUndefined(Arr.findFirst(emptied.scopes, (s) => s.scope === catalog.scope))).toMatchObject({
@@ -1519,7 +1571,7 @@ describe.skipIf(url === undefined)("Postgres server", () => {
             })
           ))._tag
         ).toBe("Failure")
-        expect(yield* sql`SELECT * FROM echosync_catalog_releases`).toHaveLength(2)
+        expect(yield* sql`SELECT * FROM echosync_catalog_releases`).toHaveLength(5)
       })
     )
   )
@@ -1613,12 +1665,21 @@ describe.skipIf(url === undefined)("Postgres server", () => {
         for (let i = 0; i < 8; i++) {
           yield* server.execute(alice, request(`shared-listener-${i}`))
           yield* nextPoke(first.queue)
-          yield* sql`SELECT pg_notify('echosync_changes','presence')`
+          yield* server.presence(alice, {
+            connectionId: first.initial.connectionId ?? "",
+            room: privateScope(alice),
+            clientId: "first",
+            state: { i }
+          })
         }
         // A presence refresh after the data refresh must not overwrite slow reader's sticky Poke.
-        yield* Queue.take(first.queue)
+        while (!Equal.equals((yield* Queue.take(first.queue)).presence?.[0]?.state, { i: 7 })) yield* Effect.yieldNow
         expect(frames).toBe(1)
-        expect(Arr.some(yield* Queue.clear(unrelated.queue), (frame) => frame._tag === "Poke")).toBe(false)
+        // Unrelated writes and invisible presence send no frame at all, not merely no Poke.
+        expect(yield* Queue.clear(unrelated.queue)).toHaveLength(0)
+        // Maintenance still sends an unchanged frame, or idle clients would time out and reconnect.
+        yield* TestClock.adjust("25 seconds")
+        expect((yield* Queue.take(unrelated.queue))._tag).toBe("Keepalive")
         yield* Deferred.succeed(resume, undefined)
         expect((yield* Queue.take(paused))._tag).toBe("Poke")
         expect(entries(yield* server.pull(alice, { epoch: null, cursors: {} }))).toHaveLength(8)

@@ -202,9 +202,11 @@ export const make = Effect.fn("EchoSync.Server.make")(function* (
     sql
       .withTransaction(
         Effect.gen(function* () {
-          yield* sql`SET TRANSACTION ISOLATION LEVEL SERIALIZABLE`
-          // Even a rejected/no-op batch must invalidate a waiting writer's old MVCC snapshot.
-          yield* sql`UPDATE echosync_engine SET cursor=cursor`
+          // Every engine writer takes this row lock first, so writers run one at a time. READ
+          // COMMITTED makes a writer that waited read the previous writer's commit instead of
+          // failing on its pre-wait snapshot, so concurrent writers queue rather than retry.
+          yield* sql`SET TRANSACTION ISOLATION LEVEL READ COMMITTED`
+          yield* sql`SELECT 1 FROM echosync_engine FOR UPDATE`
           return yield* body
         })
       )
@@ -597,13 +599,23 @@ export const make = Effect.fn("EchoSync.Server.make")(function* (
             return { ...row, state: yield* encode(a.definition.state, state) }
           })
         )
-        const existing = yield* sql<Row>`SELECT aggregate,id,scope,seq,state FROM echosync_streams`
-        for (const row of rows)
-          if (Arr.some(existing, (r) => r.aggregate === row.aggregate && r.id === row.id && r.scope !== catalog.scope))
-            return yield* new Wire.ServerError({ message: "Catalog id belongs to another scope" })
-        yield* sql`DELETE FROM echosync_streams WHERE scope=${catalog.scope}`
-        for (const row of rows)
-          yield* sql`INSERT INTO echosync_streams VALUES (${row.aggregate},${row.id},${catalog.scope},${(Option.getOrUndefined(Arr.findFirst(existing, (r) => r.aggregate === row.aggregate && r.id === row.id))?.seq ?? 0) + 1},${sql.json(row.state)})`
+        const keys = new Set(Arr.map(rows, (row) => `${row.aggregate.length}:${row.aggregate}${row.id}`))
+        if (keys.size !== rows.length) return yield* new Wire.ServerError({ message: "Duplicate catalog row" })
+        // Set-based diff: unchanged rows keep their sequence and record no scope change, so
+        // incremental readers download only changed and removed rows of a new release.
+        // A caller's enclosing transaction may already hold this table from an earlier ingest.
+        yield* sql`DROP TABLE IF EXISTS pg_temp.echosync_catalog_input`
+        yield* sql`CREATE TEMP TABLE echosync_catalog_input ON COMMIT DROP AS
+          SELECT * FROM jsonb_to_recordset(${sql.json(rows)}) AS r(aggregate text,id text,state jsonb)`
+        const foreign =
+          yield* sql`SELECT 1 FROM echosync_streams s JOIN echosync_catalog_input r USING(aggregate,id) WHERE s.scope<>${catalog.scope} LIMIT 1`
+        if (foreign.length > 0) return yield* new Wire.ServerError({ message: "Catalog id belongs to another scope" })
+        yield* sql`DELETE FROM echosync_streams s WHERE s.scope=${catalog.scope}
+          AND NOT EXISTS(SELECT 1 FROM echosync_catalog_input r WHERE r.aggregate=s.aggregate AND r.id=s.id)`
+        yield* sql`INSERT INTO echosync_streams(aggregate,id,scope,seq,state)
+          SELECT aggregate,id,${catalog.scope},1,state FROM echosync_catalog_input
+          ON CONFLICT(aggregate,id) DO UPDATE SET seq=echosync_streams.seq+1,state=EXCLUDED.state
+          WHERE echosync_streams.state IS DISTINCT FROM EXCLUDED.state`
         yield* changed([catalog.scope])
         yield* sql`INSERT INTO echosync_catalog_releases(scope,release,cursor) SELECT ${catalog.scope},${catalog.release},cursor FROM echosync_engine`
       })

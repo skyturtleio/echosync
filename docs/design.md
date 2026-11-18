@@ -54,7 +54,7 @@ confirmed event's `at` is what everyone converges on, so no rule orders by `now`
 (aggregate instance). The device decides the batch against *confirmed state ⊕ pending
 batches*, appends it to a durable **journal**, updates in-memory **effective state** and
 re-emits affected queries, without consulting connectivity. The server decides the same batch
-in one `SERIALIZABLE` transaction, appends the events to each stream, writes a **receipt**
+in one transaction serialized by the engine row lock (§2 item 40), appends the events to each stream, writes a **receipt**
 keyed by batch id (accepted *or* rejected), and publishes to the **scope log** of each touched
 scope. Devices pull scope logs by cursor; on every confirmed change the leader rebases:
 confirmed state advances, pending batches are re-decided in journal order (a batch that now
@@ -74,8 +74,8 @@ the engine.
 | `policy_outbox` | `(event ref)` | events awaiting policies, at-least-once |
 | `engine` | singleton | `epoch` |
 
-`Execute { clientId, batches }`, per batch, one serializable transaction retried on
-serialization failure: resolve the principal from the session (an app-provided layer; nothing
+`Execute { clientId, batches }`, per batch, one engine-locked transaction retried on
+deadlock: resolve the principal from the session (an app-provided layer; nothing
 in the body is trusted for identity); return the existing receipt if `(clientId, batchId)` has
 one; for each command load the stream, require a writer grant on `scope(state)` (or the
 creation scope of a new stream) and that `authority` allows the server, run `decide`, on a
@@ -144,8 +144,8 @@ and sees the rejection); *independent fields* (the command carries a change set,
 records it, `evolve` merges; same-field edits are last-writer-wins by server order); a *stale
 base* (opt-in `expectedSeq`, `decide` returns `Stale`); a *vanished target or lost access*
 (`NotFound` / `ScopeForbidden` from the server, surfaced as notices). Uniqueness and in-use
-checks are `ctx.read` over an index inside `decide`: authoritative on the server because the
-transaction is serializable, optimistic on the device and corrected by the rebase (§2 item 2).
+checks are `ctx.read` over an index inside `decide`: authoritative on the server because engine
+writers are serialized, optimistic on the device and corrected by the rebase (§2 item 2).
 
 **Schema evolution.** Command/event payloads have opt-in explicit versions and pure direct
 historical adapters (§2 item 36). Events remain immutable; replay decodes historical facts
@@ -181,8 +181,8 @@ behaviour adds or amends an item here in the same branch.
    periodic `Snapshot` event per stream. Rejected: state-only rows.
 2. **Cross-stream checks are `ctx.read` in `decide`, declared per command** (`reads: [...]`,
    2026-10-29), not Alchemy's rule of an aggregate per protected value. On the server the read
-   is inside the SERIALIZABLE transaction, so two concurrent creates of one unique value cannot
-   both commit (SSI aborts one; its retry sees the other); on the device it reads effective
+   is inside the engine-locked transaction, so two concurrent creates of one unique value cannot
+   both commit (the second waits for the lock, then reads the first's commit; item 40); on the device it reads effective
    state and the rebase re-decides. Rejected: a stream per unique value with `Claim`/`Release`
    in the same batch, and counter aggregates for in-use checks; pure and shardable, but they
    exist because Durable Objects cannot share a transaction, and one Postgres already gives the
@@ -270,7 +270,7 @@ behaviour adds or amends an item here in the same branch.
 
 15. **First dogfood server uses serialized writes and snapshot pulls** (2026-10-30).
     A transactional singleton lock orders SERIALIZABLE writes and cursor advancement; retry
-    serialization failures. This trades write throughput for a small, correct first slice,
+    serialization failures (item 40 replaces this retry storm with a READ COMMITTED queue). This trades write throughput for a small, correct first slice,
     rather than using sequence allocations that can commit out of cursor order. Pull returns
     the complete visible scope list and replaces a changed scope with current state; unchanged
     cursors return no rows. Receipts are retained indefinitely and bound to authenticated
@@ -394,7 +394,7 @@ behaviour adds or amends an item here in the same branch.
     in order so an earlier domain rejection takes precedence over a malformed later command.
     Rejected: decoding every stream for every Execute, or eagerly preparing a whole batch before
     deciding (changes rejection precedence). Multi-command batches may reload a declared-read
-    aggregate; receipts, atomicity, authorization and SERIALIZABLE uniqueness remain unchanged.
+    aggregate; receipts, atomicity, authorization and lock-serialized uniqueness remain unchanged.
 
 25. **Collaboration uses explicit grants and trusted atomic actions** (2026-11-01).
     Shared scopes have reader/writer/owner grants; private ownership and catalog readership
@@ -683,6 +683,29 @@ behaviour adds or amends an item here in the same branch.
     Rejected: hosted telemetry, persistent browser history, per-row/frame logs, raw error
     serialization, new protocol correlation fields and timeouts that change operation semantics.
 
+40. **Engine writers queue on a row lock; catalogs diff; Changes frames only on change**
+    (2026-11-18). Measured on 4.1.4: a SERIALIZABLE writer waiting on the singleton row keeps
+    the snapshot it took before the wait and fails when the holder commits. With eight retries
+    and no backoff, bursts of 16, 32 or 64 independent writers committed nine and failed the
+    rest. Engine transactions now run at READ COMMITTED and take `SELECT … FOR UPDATE` on the
+    engine row first (imports keep their caller's isolation and lock the same row), so writers
+    run one at a time and every statement after the wait reads earlier commits. Declared-read
+    uniqueness stays authoritative because no other engine writer commits while the lock is
+    held. Deadlock retry remains. Rejected: more retries or backoff (still quadratic work with
+    a cap), and sequence-allocated revisions (allocation order is not commit order; item 15).
+    `echosync_streams(scope text_pattern_ops, aggregate, id)` serves scope snapshots, declared
+    reads by scope and the `catalog:%` prefix independent of database collation.
+    Catalog ingestion refuses duplicate ids, then diffs the release as a set in SQL: removed
+    rows are deleted, new rows start at sequence 1, changed rows advance their sequence and
+    unchanged rows are untouched. The stream change trigger therefore records only real
+    changes, and incremental readers download only those; a reset still returns the whole
+    catalog. Rejected: delete-and-reinsert, which resent every row on every release and issued
+    one statement per row.
+    A Changes refresh sends a reader a frame only for a pending poke, a changed epoch or visible
+    presence, or the 25-second maintenance tick that keeps streams alive; presence is ordered so
+    snapshots compare stably. Unrelated writes and unchanged presence heartbeats send nothing.
+    Rejected: presence deltas on the wire (a protocol change).
+
 ## 3. Invariants catalogue
 
 The behaviours a rule-abiding engine promises, as a numbered list `INV-<AREA>-<n>`, one or
@@ -757,7 +780,8 @@ devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
   A stream initialized by a registered historical event accepts subsequent ordinary events;
   registration alone never authorizes a command to emit that historical event.
 - **INV-SERVER-2:** Concurrent decisions serialize, including declared index reads; two
-  claims for the same visible unique value cannot both be accepted.
+  claims for the same visible unique value cannot both be accepted. Independent concurrent
+  writers queue rather than fail.
 - **INV-SERVER-3:** Ordinary writes require writer/owner access; declared reads see authorized
   scopes only, hidden ids read as null, and undeclared reads fail.
   Undeclared command input fields cannot replace server-computed ownership or authority.
@@ -766,14 +790,15 @@ devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
 - **INV-SERVER-4:** Pull snapshots and cursors share one transaction snapshot; reconnect
   cannot skip committed state. Epoch mismatches refuse writes and pulls.
 - **INV-SERVER-5:** Catalog ingestion validates state and catalog scope, writes no per-row
-  events, and atomically exposes a release to readers.
+  events, and atomically exposes a release to readers. A later release records only changed
+  and removed rows, so incremental readers download only those; unchanged rows keep their sequence.
 - **INV-SERVER-6:** HTTP RPC resolves identity outside request bodies and Changes wakes a
   connected reader after a commit; reconnect starts with a catchup poke.
   Shared listener failure ends dependent streams; registration and reconnect cannot lose a
   committed change. Presence traffic cannot erase a pending data invalidation.
 - **INV-SERVER-10:** A scoped server owns one isolated Changes listener independent of reader
   count. Slow readers do not block peers; pending invalidations coalesce within fixed bounds.
-  Unrelated private-scope writes do not poke other readers. Closing a reader preserves its peers;
+  Unrelated private-scope writes and invisible presence send other readers no frame. Closing a reader preserves its peers;
   closing the server releases its listener and terminates its streams. Shared lease/epoch/presence
   refresh performs no per-reader snapshot transactions and refuses expired connection tokens.
 - **INV-SERVER-11:** Explicit naming migration preserves all engine rows, epoch/cursors,
