@@ -578,7 +578,8 @@ behaviour adds or amends an item here in the same branch.
     Opted-in catchups materialize a fixed authorized view in expiring server staging tables,
     page its entries, and recheck the principal, epoch and grant generation on every page.
     Clients install only the complete response; intermediate pages advance neither durable
-    cursors nor receipt coverage. Grant changes invalidate staged catchups and scope history.
+    cursors nor receipt coverage. Grant changes invalidate staged catchups and scope history (item 41 narrows history
+    invalidation to the principal whose grant is new).
     Projection rebuilds advance scope floors and a durable engine sync generation, checked
     on continuation, including staging transactions that commit after the rebuild. Migration
     holds the engine writer lock before initializing floors and installing stream tracking.
@@ -706,6 +707,22 @@ behaviour adds or amends an item here in the same branch.
     snapshots compare stably. Unrelated writes and unchanged presence heartbeats send nothing.
     Rejected: presence deltas on the wire (a protocol change).
 
+41. **A new grant bootstraps only its own principal** (2026-11-18). Incremental Pull trusts
+    the client's cursor, so a principal must never catch up from before its own access began:
+    a forged or stale cursor would replay `Gone` identities of rows that left the scope before
+    the grant. Item 37 enforced this by raising the scope floor on every grant change, which
+    reset every member, so adding one person to a shared scope re-downloaded it for everyone.
+    `echosync_grant_floors(scope, principal, cursor)` now records the commit revision at which
+    a grant took effect; Pull resets when the request cursor is below the greater of the scope
+    floor and the caller's own grant floor. Revocation deletes the floor; a later grant sets a
+    new one; role changes keep it. Imported grants set it too. Grants created before this table
+    have no row and stay covered by the scope floors their grant raised. Grant changes still
+    wake every Changes reader and invalidate staged pages through the grant position, but no
+    longer raise scope floors; projection rebuilds and compaction still do. Rejected: a `since`
+    column on `echosync_grants` (applications compare that table with `SELECT *`, and a column
+    default would silently let directly seeded grants replay history) and replaying history on
+    grant (item 3: a reader who gains a scope receives snapshots).
+
 ## 3. Invariants catalogue
 
 The behaviours a rule-abiding engine promises, as a numbered list `INV-<AREA>-<n>`, one or
@@ -722,7 +739,8 @@ devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
 - **INV-SYNC-2:** Incremental catchups preserve a transaction-consistent complete scope view
   across bounded pages and intervening commits. Retries replay the same staged page; expired,
   compacted or missing cursors fall back safely. Deletes, moves and grant transitions cannot
-  leak historical access or advance receipt coverage before atomic installation. A steady-state
+  leak historical access or advance receipt coverage before atomic installation. A new grant
+  bootstraps only its own principal; members whose access is unchanged keep their cursors. A steady-state
   row change persists only that record and replica metadata, with atomic abort/reopen recovery;
   unchanged replicas write no records. Projection rebuilds invalidate old staged pages and
   force snapshot fallback. Old HTTP protocol clients cannot execute commands.

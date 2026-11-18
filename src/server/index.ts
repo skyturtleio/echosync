@@ -222,11 +222,17 @@ export const make = Effect.fn("EchoSync.Server.make")(function* (
     const rows = yield* sql<Engine>`SELECT epoch,cursor::text FROM echosync_engine`
     return rows[0] ?? fail("Run EchoSync migrate before serving requests")
   })
-  const changed = Effect.fnUntraced(function* (scopes: ReadonlyArray<string>, global: boolean = false) {
+  const changed = Effect.fnUntraced(function* (
+    scopes: ReadonlyArray<string>,
+    global: boolean = false,
+    floors: boolean = false
+  ) {
     yield* sql`UPDATE echosync_engine SET cursor=cursor+1`
     for (const scope of new Set(scopes))
       yield* sql`INSERT INTO echosync_scopes(scope,cursor) SELECT ${scope},cursor FROM echosync_engine ON CONFLICT(scope) DO UPDATE SET cursor=EXCLUDED.cursor`
-    if (global) {
+    // Only a projection rebuild invalidates scope history. A grant change wakes every reader but
+    // keeps existing members' cursors; the new member's grant floor forces its own bootstrap.
+    if (floors) {
       for (const scope of new Set(scopes))
         yield* sql`INSERT INTO echosync_scope_floors(scope,cursor) SELECT scope,cursor FROM echosync_scopes WHERE scope=${scope} ON CONFLICT(scope) DO UPDATE SET cursor=EXCLUDED.cursor`
     }
@@ -268,7 +274,7 @@ export const make = Effect.fn("EchoSync.Server.make")(function* (
           // A staged old projection must not finish after a rebuild, even if its staging
           // transaction commits after this one. A generation check fences that race.
           yield* sql`UPDATE echosync_engine SET sync_generation=sync_generation+1`
-          yield* changed([...scopes], true)
+          yield* changed([...scopes], true, true)
         }
         return count
       })
@@ -501,9 +507,15 @@ export const make = Effect.fn("EchoSync.Server.make")(function* (
               const role = change.kind === "grant" ? change.grant.role : null
               if (role === null) {
                 yield* sql`DELETE FROM echosync_grants WHERE scope=${scope} AND principal=${subject}`
+                yield* sql`DELETE FROM echosync_grant_floors WHERE scope=${scope} AND principal=${subject}`
                 yield* sql`DELETE FROM echosync_presence p USING echosync_connections c WHERE p.connection_id=c.id AND p.room=${scope} AND c.principal=${subject}`
-              } else
+              } else {
+                // Only a new grant sets the floor; a role change keeps the member's history.
+                yield* sql`INSERT INTO echosync_grant_floors(scope,principal,cursor) SELECT ${scope},${subject},cursor+1 FROM echosync_engine
+                  WHERE NOT EXISTS(SELECT 1 FROM echosync_grants WHERE scope=${scope} AND principal=${subject})
+                  ON CONFLICT(scope,principal) DO UPDATE SET cursor=EXCLUDED.cursor`
                 yield* sql`INSERT INTO echosync_grants VALUES(${scope},${subject},${role}) ON CONFLICT(scope,principal) DO UPDATE SET role=EXCLUDED.role`
+              }
               yield* sql`INSERT INTO echosync_grant_events(scope,subject,role,actor,batch_id,at) VALUES(${scope},${subject},${role},${principal},${batch.id},${DateTime.formatIso(now)})`
             }
           }
@@ -723,6 +735,8 @@ export const make = Effect.fn("EchoSync.Server.make")(function* (
           if (Str.startsWith("user:")(grant.scope) || Str.startsWith("catalog:")(grant.scope))
             return yield* new Wire.ServerError({ message: "Intrinsic scope grants cannot change" })
           yield* sql`INSERT INTO echosync_grants VALUES(${grant.scope},${grant.principal},${grant.role})`
+          yield* sql`INSERT INTO echosync_grant_floors(scope,principal,cursor) SELECT ${grant.scope},${grant.principal},cursor+1 FROM echosync_engine
+            ON CONFLICT(scope,principal) DO UPDATE SET cursor=EXCLUDED.cursor`
           yield* sql`INSERT INTO echosync_grant_events(scope,subject,role,actor,batch_id,at) VALUES(${grant.scope},${grant.principal},${grant.role},${input.principal},${input.id},${DateTime.formatIso(now)})`
           scopes.add(grant.scope)
         }

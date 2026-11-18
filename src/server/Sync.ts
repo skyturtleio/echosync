@@ -16,6 +16,9 @@ export const migrate = Effect.gen(function* () {
   yield* sql`ALTER TABLE echosync_engine ADD COLUMN IF NOT EXISTS sync_generation bigint NOT NULL DEFAULT 0`
   yield* sql`CREATE TABLE IF NOT EXISTS echosync_scope_floors(scope text PRIMARY KEY, cursor bigint NOT NULL)`
   yield* sql`INSERT INTO echosync_scope_floors SELECT scope,cursor FROM echosync_scopes ON CONFLICT DO NOTHING`
+  // A principal's own catchup floor per granted scope: the revision its grant took effect.
+  // Grants older than this table are covered by the scope floors their grant raised.
+  yield* sql`CREATE TABLE IF NOT EXISTS echosync_grant_floors(scope text NOT NULL, principal text NOT NULL, cursor bigint NOT NULL, PRIMARY KEY(scope,principal))`
   yield* sql`CREATE TABLE IF NOT EXISTS echosync_scope_changes(scope text NOT NULL, revision bigint NOT NULL, aggregate text NOT NULL,id text NOT NULL,PRIMARY KEY(scope,revision,aggregate,id))`
   // Engine writers hold the singleton lock and advance it once after all stream mutations.
   // Store identities, not historical state: catchup returns only the authorized current view.
@@ -75,9 +78,10 @@ export const pull = Effect.fnUntraced(function* (principal: Principal, request: 
           yield* sql`SELECT scope,principal,role FROM echosync_grants WHERE principal=${principal}`
         )
         const scopes = yield* sql<{ readonly scope: string; readonly cursor: string; readonly floor: string }>`
-        SELECT s.scope,s.cursor::text,coalesce(f.cursor,0)::text AS floor FROM
+        SELECT s.scope,s.cursor::text,greatest(coalesce(f.cursor,0),coalesce(gf.cursor,0))::text AS floor FROM
         (SELECT scope,cursor FROM echosync_scopes UNION SELECT ${privateScope(principal)},0 WHERE NOT EXISTS(SELECT 1 FROM echosync_scopes WHERE scope=${privateScope(principal)})) s
         LEFT JOIN echosync_scope_floors f ON f.scope=s.scope
+        LEFT JOIN echosync_grant_floors gf ON gf.scope=s.scope AND gf.principal=${principal}
         WHERE s.scope=${privateScope(principal)} OR s.scope LIKE 'catalog:%' OR EXISTS(SELECT 1 FROM echosync_grants g WHERE g.scope=s.scope AND g.principal=${principal}) ORDER BY s.scope`
         const response: Wire.PullResponse = {
           epoch: engine.epoch,

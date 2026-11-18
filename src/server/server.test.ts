@@ -333,8 +333,14 @@ describe.skipIf(url === undefined)("Postgres server", () => {
                 new TagHistoryImported({ snapshot: { name: `name-${i}`, scope: privateScope(alice), removed: false } })
               ])
             ),
-            grants: [{ scope: room, principal: alice, role: "owner" }]
+            grants: [
+              { scope: room, principal: alice, role: "owner" },
+              { scope: room, principal: bob, role: "reader" }
+            ]
           })
+          // Imported grants set floors too: a forged cursor from before the import bootstraps.
+          const forged = yield* server.pull(bob, { epoch: null, cursors: { [room]: 0 }, incremental: true })
+          expect(Option.getOrUndefined(Arr.findFirst(forged.scopes, (s) => s.scope === room))?.reset).toBe(true)
           const initial = yield* server.pull(alice, { epoch: null, cursors: {}, incremental: true })
           expect(entries(initial)).toHaveLength(2048)
           expect(initial.page?.next).toBe(2048)
@@ -435,6 +441,7 @@ describe.skipIf(url === undefined)("Postgres server", () => {
                 { id: `membership-${enabled}`, commands: [], action: { name: "membership", input: { enabled } } }
               ]
             })
+          const member = yield* server.pull(bob, { epoch: delta.epoch, cursors: {}, incremental: true })
           yield* mutateMembership(false)
           expect(
             (yield* Effect.result(
@@ -450,9 +457,20 @@ describe.skipIf(url === undefined)("Postgres server", () => {
           expect(Arr.some(revoked.scopes, (s) => s.scope === room)).toBe(false)
           yield* mutateMembership(true)
           const granted = yield* server.pull(alice, { epoch: delta.epoch, cursors: cursors(moved), incremental: true })
+          // A stale or forged cursor from before the new grant bootstraps; it cannot replay history.
           expect(Option.getOrUndefined(Arr.findFirst(granted.scopes, (s) => s.scope === room))).toMatchObject({
             reset: true,
             entries: [{ _tag: "Upsert", id: "row-2000" }]
+          })
+          // A member whose access never changed keeps its cursor: others' grants send it nothing.
+          const continuing = yield* server.pull(bob, {
+            epoch: delta.epoch,
+            cursors: cursors(member),
+            incremental: true
+          })
+          expect(Option.getOrUndefined(Arr.findFirst(continuing.scopes, (s) => s.scope === room))).toMatchObject({
+            reset: false,
+            entries: []
           })
           yield* server.ingestCatalog({
             scope: "catalog:deletes",
