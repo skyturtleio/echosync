@@ -576,7 +576,9 @@ behaviour adds or amends an item here in the same branch.
     initializes it at existing cursors without changing epochs, receipts or streams. Initial,
     future and compacted cursors receive snapshots. Legacy Pull remains snapshot-only.
     Opted-in catchups materialize a fixed authorized view in expiring server staging tables,
-    page its entries, and recheck the principal, epoch and grant generation on every page.
+    page its entries (8192 per page; raised from 2048 on 2026-11-18 because page count, not
+    payload, dominated catalog bootstraps: 42 round trips for 84,780 rows, now 11), and recheck
+    the principal, epoch and grant generation on every page.
     Clients install only the complete response; intermediate pages advance neither durable
     cursors nor receipt coverage. Grant changes invalidate staged catchups and scope history (item 41 narrows history
     invalidation to the principal whose grant is new).

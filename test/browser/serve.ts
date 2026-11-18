@@ -63,7 +63,7 @@ await Effect.runPromise(
                     yield* server.importStreams({
                       id: "incremental-fixture",
                       principal: Principal.make("browser-fixture"),
-                      streams: Array.from({ length: 3001 }, (_, i) =>
+                      streams: Array.from({ length: 9001 }, (_, i) =>
                         Server.importedStream(Tag, TagId.make(`incremental-${i}`), [
                           new TagHistoryImported({
                             snapshot: {

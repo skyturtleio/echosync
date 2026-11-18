@@ -156,7 +156,7 @@ describe.skipIf(url === undefined)("Postgres server", () => {
         yield* server.importStreams({
           id: "private-import",
           principal: alice,
-          streams: Arr.makeBy(2049, (n) =>
+          streams: Arr.makeBy(8193, (n) =>
             Server.importedStream(Tag, TagId.make(`private-${n}`), [
               new TagHistoryImported({
                 snapshot: { name: "private-payload", scope: privateScope(alice), removed: false }
@@ -189,7 +189,7 @@ describe.skipIf(url === undefined)("Postgres server", () => {
               operation: "Pull",
               page: "first",
               outcome: "succeeded",
-              count: 2048,
+              count: 8192,
               pageCount: 1,
               mode: "bootstrap"
             }),
@@ -328,7 +328,7 @@ describe.skipIf(url === undefined)("Postgres server", () => {
           yield* server.importStreams({
             id: "many",
             principal: alice,
-            streams: Arr.makeBy(2501, (i) =>
+            streams: Arr.makeBy(8501, (i) =>
               Server.importedStream(Tag, TagId.make(`row-${Str.padStart(4, "0")(String(i))}`), [
                 new TagHistoryImported({ snapshot: { name: `name-${i}`, scope: privateScope(alice), removed: false } })
               ])
@@ -342,8 +342,8 @@ describe.skipIf(url === undefined)("Postgres server", () => {
           const forged = yield* server.pull(bob, { epoch: null, cursors: { [room]: 0 }, incremental: true })
           expect(Option.getOrUndefined(Arr.findFirst(forged.scopes, (s) => s.scope === room))?.reset).toBe(true)
           const initial = yield* server.pull(alice, { epoch: null, cursors: {}, incremental: true })
-          expect(entries(initial)).toHaveLength(2048)
-          expect(initial.page?.next).toBe(2048)
+          expect(entries(initial)).toHaveLength(8192)
+          expect(initial.page?.next).toBe(8192)
           const all = [...entries(initial)]
           const edit: Wire.ExecuteRequest = {
             epoch: initial.epoch,
@@ -365,11 +365,11 @@ describe.skipIf(url === undefined)("Postgres server", () => {
             const next = yield* server.pull(alice, input)
             expect(yield* server.pull(alice, input)).toEqual(next)
             expect(next.revision).toBe(initial.revision)
-            expect(entries(next).length).toBeLessThanOrEqual(2048)
+            expect(entries(next).length).toBeLessThanOrEqual(8192)
             all.push(...entries(next))
             page = next.page
           }
-          expect(all).toHaveLength(2501)
+          expect(all).toHaveLength(8501)
           expect(Option.getOrUndefined(Arr.findFirst(all, (entry) => entry.id === "row-2000"))).toMatchObject({
             state: { removed: false }
           })
@@ -389,7 +389,7 @@ describe.skipIf(url === undefined)("Postgres server", () => {
           ])
           expect(Arr.every(delta.scopes, (scope) => !scope.reset)).toBe(true)
           const legacy = yield* server.pull(alice, { epoch: initial.epoch, cursors: cursors(initial) })
-          expect(entries(legacy)).toHaveLength(2501)
+          expect(entries(legacy)).toHaveLength(8501)
           expect(legacy.page).toBeUndefined()
           expect(
             entries(yield* server.pull(alice, { epoch: delta.epoch, cursors: cursors(delta), incremental: true }))
@@ -449,7 +449,7 @@ describe.skipIf(url === undefined)("Postgres server", () => {
                 epoch: initial.epoch,
                 cursors: {},
                 incremental: true,
-                continuation: { id: initial.page?.id ?? "", offset: 2048 }
+                continuation: { id: initial.page?.id ?? "", offset: 8192 }
               })
             ))._tag
           ).toBe("Failure")

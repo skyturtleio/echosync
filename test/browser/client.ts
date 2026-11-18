@@ -1324,7 +1324,7 @@ const largeCatalog = (profile: string, reload: boolean) =>
     Effect.gen(function* () {
       const http = yield* Client.httpTransport(`${location.origin}/sync`)
       let seenCursors: Readonly<Record<string, number>> = {}
-      let received = -1
+      let received = 0
       const transport: Client.Transport = {
         ...http,
         pull: (request) => {
@@ -1332,7 +1332,7 @@ const largeCatalog = (profile: string, reload: boolean) =>
           return http.pull(request).pipe(
             Effect.tap((reply) =>
               Effect.sync(() => {
-                received = Arr.reduce(reply.scopes, 0, (n, s) => n + s.entries.length)
+                received += Arr.reduce(reply.scopes, 0, (n, s) => n + s.entries.length)
               })
             )
           )
@@ -1368,7 +1368,9 @@ const largeCatalog = (profile: string, reload: boolean) =>
           received === 0 && (seenCursors["catalog:transport"] ?? 0) > 0,
           "durable cursor redownloaded catalog"
         )
-      // Keep the same transport deadline; this is not a relaxed fixture timeout.
+      else yield* check(received >= 84_780, "catalog bootstrap did not receive every row")
+      // A performance budget for a new device's catalog bootstrap (about 11 Pull pages), not a
+      // transport deadline: those are 30 s per request. Page count dominates; see Sync.pageSize.
       yield* check(elapsed < 5_000, `large catalog sync exceeded 5s: ${elapsed.toFixed(1)}ms`)
       return `PASS INV-SYNC-1 ${reload ? "durable navigation/reopen, unchanged Pull" : "HTTP/PG catalog"}: 84780 exact rows, ${received} received, ${elapsed.toFixed(1)}ms`
     })

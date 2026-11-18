@@ -67,6 +67,11 @@ export const expire = Effect.fnUntraced(function* (retentionMillis: number) {
   yield* sql`DELETE FROM echosync_scope_changes c USING echosync_scope_floors f WHERE c.scope=f.scope AND c.revision<=f.cursor`
 })
 
+/** Entries per Pull page. Each page is a round trip plus a staged-read transaction, so a
+ * catalog bootstrap's latency is dominated by page count; 8192 rows of a few hundred bytes
+ * stay far below the client's 64 Mi frame limit. */
+const pageSize = 8192
+
 /** Materialize a fixed view before paging; no SQL transaction or connection spans requests. */
 export const pull = Effect.fnUntraced(function* (principal: Principal, request: Wire.PullRequest) {
   const sql = yield* PgClient.PgClient
@@ -149,8 +154,8 @@ export const pull = Effect.fnUntraced(function* (principal: Principal, request: 
         readonly position: string
         readonly scope: string
         readonly entry: unknown
-      }>`SELECT position::text,scope,entry FROM echosync_pull_entries WHERE session=${id}::uuid AND position>${offset} ORDER BY echosync_pull_entries.position LIMIT 2049`
-      const page = rows.slice(0, 2048)
+      }>`SELECT position::text,scope,entry FROM echosync_pull_entries WHERE session=${id}::uuid AND position>${offset} ORDER BY echosync_pull_entries.position LIMIT ${pageSize + 1}`
+      const page = rows.slice(0, pageSize)
       const entries = new Map<string, Array<typeof Wire.Entry.Type>>()
       for (const row of page) {
         const values = entries.get(row.scope) ?? []
@@ -160,7 +165,7 @@ export const pull = Effect.fnUntraced(function* (principal: Principal, request: 
       return {
         ...response,
         scopes: Arr.map(response.scopes, (scope) => ({ ...scope, entries: entries.get(scope.scope) ?? [] })),
-        page: { id, next: rows.length > 2048 ? Number(page[page.length - 1]?.position ?? offset) : null }
+        page: { id, next: rows.length > pageSize ? Number(page[page.length - 1]?.position ?? offset) : null }
       }
     })
   )
