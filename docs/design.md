@@ -798,6 +798,33 @@ behaviour adds or amends an item here in the same branch.
     (the stored definition is as cheap to compare and readable), and running `migrate` from
     `make` (construction precedes some apps' migrations).
 
+46. **Every tab shows the profile's sync state** (2026-11-18). Only the tab owning the network
+    set `lastSynced`, so every other tab of a profile reported `idle` with `lastSynced: null`
+    forever, which apps show as offline: after a deploy, four new page loads stayed "offline"
+    for 16 minutes while an old tab kept the connection. The owner now reports `connection`,
+    `lastSynced` and the error's tag on its own BroadcastChannel (`echosync:<profile>:status`)
+    whenever they change and when a tab asks; other tabs mirror it and keep their own
+    `pending`, compatibility issues, `reset` and `incompatible`. A mirrored error keeps only
+    its tag (a `TransportError` with the owner's reason, else a `ClientError`), because causes
+    are not cloneable. An owner announces `released` while it still holds the leader lock, and
+    a successor starts from the status it mirrored, so a takeover never reports "never synced".
+    A closed or crashed tab runs no finalizer and sends no `released`, so a mirroring tab also
+    asks again every minute and treats an unanswered request (one second) as no reporting owner.
+    The state lives in memory only: a live owner answers a new tab within milliseconds, sooner
+    than an owner's own first sync, and a durable copy would outlive the owner that wrote it
+    and show a stale time as current, or "connected" while no tab is connected. Older bundles
+    never open the status channel, so they never receive these messages; the main channel now
+    also ignores messages it does not know instead of treating them as a sync request. A tab
+    whose request goes unanswered for a second while another tab holds the leader lock is
+    behind an older bundle's owner: it syncs itself, then again whenever a minute passes
+    without a report, so it shows its own real result (a `lastSynced` at most a minute old,
+    offline, auth) until that tab closes; auth and oversized stop this as they stop the owner.
+    A tab opened with `autoConnect: false` never syncs on its own: it keeps the last report.
+    Rejected: a durable status record (stale or false after its writer dies), inferring health
+    from relayed Changes frames (frames still arrive while syncs fail), every tab syncing on
+    open (one connection per profile), and a new message on the main channel (an older owner
+    reads any unknown message as a sync request, and an older follower publishes on it).
+
 ## 3. Invariants catalogue
 
 The behaviours a rule-abiding engine promises, as a numbered list `INV-<AREA>-<n>`, one or
@@ -932,6 +959,11 @@ devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
 - **INV-CLIENT-11:** A reconnecting device sends its pending backlog in journal order, up to 32
   intents (and a bounded size) per Execute request, then pulls once per request; each intent keeps its own receipt,
   so a server rejection inside a shared request becomes that intent's notice only.
+- **INV-CLIENT-12:** A tab that does not own the network reports the owner's connection,
+  last sync and error without networking itself, including for a tab opened after the
+  owner went idle, and keeps that last sync through an owner takeover. Unknown tab messages
+  request no sync. Behind an owner that reports nothing, including one that replaced a
+  reporting owner without notice, a tab shows its own sync result, at most once a minute.
 - **INV-SERVER-12:** Structured operation logs distinguish Pull page work from Changes
   connection lifetime without payloads, identifiers or raw failures, preserving request log
   annotations and operation outcomes.

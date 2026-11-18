@@ -3,6 +3,7 @@ import * as Cause from "effect/Cause"
 import * as Clock from "effect/Clock"
 import * as DateTime from "effect/DateTime"
 import * as Deferred from "effect/Deferred"
+import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Equal from "effect/Equal"
 import * as Exit from "effect/Exit"
@@ -108,7 +109,7 @@ const check = (condition: boolean, message: string) =>
 // Delegate methods with their original receiver; Clock services may implement them on a prototype.
 const overrideClock = (
   clock: Clock.Clock,
-  overrides: Partial<Pick<Clock.Clock, "currentTimeMillis" | "monotonicTimeNanos">>
+  overrides: Partial<Pick<Clock.Clock, "currentTimeMillis" | "monotonicTimeNanos" | "sleep">>
 ): Clock.Clock => ({
   currentTimeMillisUnsafe: () => clock.currentTimeMillisUnsafe(),
   currentTimeMillis: overrides.currentTimeMillis ?? clock.currentTimeMillis,
@@ -116,7 +117,7 @@ const overrideClock = (
   currentTimeNanos: clock.currentTimeNanos,
   monotonicTimeNanosUnsafe: () => clock.monotonicTimeNanosUnsafe(),
   monotonicTimeNanos: overrides.monotonicTimeNanos ?? clock.monotonicTimeNanos,
-  sleep: (duration) => clock.sleep(duration)
+  sleep: overrides.sleep ?? ((duration) => clock.sleep(duration))
 })
 const snapshot = (amount: number, seq = 1, epoch = "one"): PullResponse => ({
   epoch,
@@ -2929,6 +2930,192 @@ const telemetry = (profile: string) =>
     })
   )
 
+const synced = (s: Client.Status) => s.connection === "idle" && s.lastSynced !== null
+// INV-CLIENT-12 catches a tab that does not own the network reporting that the profile never synced.
+const peerStatus = (profile: string) =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      let mode: "ok" | "offline" | "auth" = "ok"
+      const pulls = new Map<string, number>()
+      const pulled = (name: string) => pulls.get(name) ?? 0
+      const pokes = yield* SubscriptionRef.make<Change>({ _tag: "Poke", epoch: "one" })
+      // Each tab counts its own pulls, so a check on one tab never races another tab's syncs.
+      const tab = (name: string, profileName = profile, autoConnect = true) => ({
+        ...options(profileName, {
+          ...disconnected,
+          pull: () =>
+            Effect.suspend(() => {
+              pulls.set(name, pulled(name) + 1)
+              return mode === "ok"
+                ? Effect.succeed(snapshot(4))
+                : Effect.fail(new Client.TransportError({ reason: mode, cause: "injected" }))
+            }),
+          changes: SubscriptionRef.changes(pokes)
+        }),
+        autoConnect
+      })
+      const leaderOf = (name: string) => `${encodeURIComponent(name)}:${encodeURIComponent(principal)}:leader`
+      const clock = yield* Clock.Clock
+      // Fifty times faster, so a minute takes 1.2 seconds and a second 20 milliseconds.
+      const fast = overrideClock(clock, { sleep: (duration) => clock.sleep(Duration.divideUnsafe(duration, 50)) })
+      const until = Effect.fnUntraced(function* (
+        client: Client.Client,
+        done: (status: Client.Status) => boolean,
+        message: string,
+        timeout: Duration.Input = "3 seconds"
+      ) {
+        const found = Option.flatten(
+          yield* client.status.pipe(Stream.filter(done), Stream.runHead, Effect.timeoutOption(timeout))
+        )
+        if (Option.isNone(found)) {
+          const last = Option.getOrUndefined(yield* client.status.pipe(Stream.runHead))
+          return yield* Effect.die(new Error(`${message} (was ${last?.connection}, ${last?.lastSynced})`))
+        }
+        return found.value
+      })
+      // The owner's current status satisfies done and the peer reports the same connection and last sync.
+      const agree = Effect.fnUntraced(function* (
+        owner: Client.Client,
+        peer: Client.Client,
+        done: (status: Client.Status) => boolean,
+        message: string,
+        timeout: Duration.Input = "3 seconds"
+      ) {
+        const found = Option.flatten(
+          yield* Stream.zipLatest(owner.status, peer.status).pipe(
+            Stream.filter(([a, b]) => done(a) && a.connection === b.connection && a.lastSynced === b.lastSynced),
+            Stream.runHead,
+            Effect.timeoutOption(timeout)
+          )
+        )
+        if (Option.isNone(found)) {
+          const last = Option.getOrUndefined(yield* peer.status.pipe(Stream.runHead))
+          return yield* Effect.die(new Error(`${message} (peer was ${last?.connection}, ${last?.lastSynced})`))
+        }
+        return found.value
+      })
+
+      const firstScope = yield* Scope.make()
+      const first = yield* Client.open(tab("first")).pipe(Effect.provideService(Scope.Scope, firstScope))
+      yield* until(first, synced, "owner never synced")
+      // The owner stays idle, sending nothing, before the second tab opens.
+      yield* Effect.sleep("300 millis")
+      const second = yield* Client.open(tab("second"))
+      // Sooner than the 1 second a tab waits for a report before syncing itself.
+      const [initial] = yield* agree(
+        first,
+        second,
+        synced,
+        "second tab did not report the owner's last sync",
+        "500 millis"
+      )
+      yield* Effect.sleep("1500 millis")
+      yield* check(pulled("second") === 0, "second tab synced although the owner reports its status")
+
+      mode = "offline"
+      yield* first.requestSync
+      const [, reported] = yield* agree(
+        first,
+        second,
+        (s) => s.connection === "offline",
+        "second tab missed the owner's offline"
+      )
+      yield* check(
+        reported.lastSynced === initial.lastSynced &&
+          reported.error instanceof Client.TransportError &&
+          reported.error.reason === "offline",
+        "offline report lost the last sync or its error"
+      )
+      mode = "ok"
+      const [recovered] = yield* agree(
+        first,
+        second,
+        (s) => synced(s) && (s.lastSynced ?? 0) > (initial.lastSynced ?? 0),
+        "second tab missed the owner's recovery"
+      )
+      yield* check(recovered.error === null, "recovery kept an error")
+
+      // Unknown main-channel messages (as from a newer bundle) neither publish nor request a sync.
+      yield* Effect.sleep("300 millis")
+      const ownerPulls = pulled("first")
+      const channel = new BroadcastChannel(`echosync:${encodeURIComponent(profile)}:${encodeURIComponent(principal)}`)
+      for (const message of ["status", { _tag: "Status", connection: "idle" }])
+        // oxlint-disable-next-line unicorn/require-post-message-target-origin -- BroadcastChannel has no targetOrigin parameter.
+        channel.postMessage(message)
+      channel.close()
+      yield* Effect.sleep("300 millis")
+      yield* check(pulled("first") === ownerPulls, "an unknown message requested a sync")
+
+      // The owner closes; the second tab takes over and never reports that it has not synced.
+      const takeover = yield* second.status.pipe(
+        Stream.takeUntil((s) => synced(s) && pulled("second") > 0),
+        Stream.runCollect,
+        Effect.timeout("3 seconds"),
+        Effect.forkScoped
+      )
+      yield* Scope.close(firstScope, Exit.void)
+      const seen = yield* Fiber.join(takeover)
+      yield* check(
+        Arr.every(seen, (s) => s.lastSynced !== null && s.lastSynced >= (recovered.lastSynced ?? 0)),
+        "successor reported no last sync during takeover"
+      )
+      // A tab that never connects automatically reports only what the owner tells it.
+      const third = yield* Client.open(tab("third", profile, false))
+      yield* agree(second, third, synced, "third tab missed the successor's status")
+      mode = "auth"
+      yield* second.requestSync
+      const [, auth] = yield* agree(second, third, (s) => s.connection === "auth", "third tab missed auth required")
+      yield* check(auth.lastSynced !== null && pulled("third") === 0, "auth report lost the last sync")
+
+      // The owner vanishes without closing (no "released") and an older bundle's tab, which
+      // reports nothing, takes the network: the peer stops trusting the old report.
+      mode = "ok"
+      const lost = `${profile}-lost`
+      const vanishingScope = yield* Scope.make()
+      const vanishing = yield* Client.open(tab("vanishing", lost)).pipe(
+        Effect.provideService(Scope.Scope, vanishingScope)
+      )
+      yield* until(vanishing, synced, "vanishing owner never synced")
+      yield* Effect.scoped(Effect.andThen(Storage.ownProfile(leaderOf(lost), true), Effect.never)).pipe(
+        Effect.forkScoped
+      )
+      yield* Effect.sleep("50 millis")
+      const peer = yield* Client.open(tab("peer", lost)).pipe(Effect.provideService(Clock.Clock, fast))
+      const [last] = yield* agree(vanishing, peer, synced, "peer did not mirror the vanishing owner")
+      // oxlint-disable-next-line typescript/unbound-method -- Capture only for restoration after dropping "released"; never invoke it unbound.
+      const postMessage = BroadcastChannel.prototype.postMessage
+      BroadcastChannel.prototype.postMessage = function (this: BroadcastChannel, message: unknown) {
+        if (message !== "released") postMessage.call(this, message)
+      }
+      yield* Scope.close(vanishingScope, Exit.void).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            BroadcastChannel.prototype.postMessage = postMessage
+          })
+        )
+      )
+      yield* Effect.sleep("20 millis")
+      yield* until(
+        peer,
+        (s) => synced(s) && (s.lastSynced ?? 0) > (last.lastSynced ?? 0) && pulled("peer") > 0,
+        "peer kept a vanished owner's report"
+      )
+
+      // An older bundle's tab owns the network from the start: a new tab syncs itself, once a minute.
+      const legacy = `${profile}-legacy`
+      yield* Storage.ownProfile(leaderOf(legacy))
+      const newer = yield* Client.open(tab("legacy", legacy)).pipe(Effect.provideService(Clock.Clock, fast))
+      yield* until(newer, synced, "new tab behind an old owner never synced")
+      const started = pulled("legacy")
+      yield* Effect.sleep("2500 millis")
+      const cycles = pulled("legacy") - started
+      yield* check(cycles >= 1 && cycles <= 3, `new tab behind an old owner synced ${cycles} times in two minutes`)
+      mode = "offline"
+      yield* until(newer, (s) => s.connection === "offline", "new tab behind an old owner kept reporting connected")
+      return "PASS INV-CLIENT-12 peer mirrors idle/offline/recovery/auth without networking, takeover keeps last sync, vanished owner re-checked, unknown messages ignored, silent old owner answered by own minute sync"
+    })
+  )
+
 const run = <A, E>(effect: Effect.Effect<A, E>) => Effect.runPromise(effect)
 Object.assign(globalThis, {
   echosyncScenarios: {
@@ -2941,6 +3128,7 @@ Object.assign(globalThis, {
     batches: (profile: string) => run(batches(profile)),
     offlineBacklog: (profile: string) => run(offlineBacklog(profile)),
     ownership: (profile: string) => run(ownership(profile)),
+    peerStatus: (profile: string) => run(peerStatus(profile)),
     diagnostics: (profile: string) => run(diagnostics(profile)),
     largeCatalog: (profile: string, reload = false) => run(largeCatalog(profile, reload)),
     oversizedCatalog: (profile: string) => run(oversizedCatalog(profile)),

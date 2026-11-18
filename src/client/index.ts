@@ -61,6 +61,9 @@ export interface Options {
   /** Best-effort scalar operation events. Return promptly; thrown exceptions are ignored. */
   readonly onTelemetry?: (event: Telemetry.TelemetryEvent) => void
 }
+/** The browser profile's sync state. Connection, last sync and error come from the tab that owns the
+ * network; other tabs mirror them. There `error` is a TransportError with the owner's reason or a
+ * ClientError whose cause is the owner error's tag; the original cause stays in the owner's tab. */
 export interface Status {
   readonly connection: "idle" | "syncing" | "offline" | "error" | "auth" | "oversized" | "reset" | "incompatible"
   readonly pending: number
@@ -252,6 +255,11 @@ const openClient = Effect.fnUntraced(function* (options: Options) {
     Effect.sync(() => new BroadcastChannel(`echosync:${namespace}`)),
     (value) => Effect.sync(() => value.close())
   )
+  // A separate channel, so bundles older than the status messages never receive them.
+  const statusChannel = yield* Effect.acquireRelease(
+    Effect.sync(() => new BroadcastChannel(`echosync:${namespace}:status`)),
+    (value) => Effect.sync(() => value.close())
+  )
   const journalDb = yield* Storage.openDatabase(`echosync:journal:${namespace}`, options.compatibilityGeneration)
   const replicaDb = yield* Storage.openDatabase(`echosync:replica:${namespace}`, options.compatibilityGeneration)
   const hydrated = yield* Storage.withLock(
@@ -289,7 +297,8 @@ const openClient = Effect.fnUntraced(function* (options: Options) {
   const mutex = yield* Semaphore.make(1)
   const syncMutex = yield* Semaphore.make(1)
   const requested = yield* SubscriptionRef.make(0)
-  let isNetworkOwner = false
+  // "peer": another tab owns the network and reports its status; "unknown": no owner has reported.
+  const role = yield* SubscriptionRef.make<"owner" | "peer" | "unknown">("unknown")
   const frame = yield* SubscriptionRef.make<Protocol.Change>({ _tag: "Keepalive", epoch: "" })
   const state = yield* SubscriptionRef.make<ReadonlyArray<Model.Row>>([])
   let read = Model.makeReader(options.principal, replica.grants)
@@ -923,8 +932,10 @@ const openClient = Effect.fnUntraced(function* (options: Options) {
       if (Schema.is(Protocol.Change)(value)) return SubscriptionRef.set(frame, value)
       if (value === "hello")
         return Effect.sync(() => {
-          if (isNetworkOwner) channel.postMessage(SubscriptionRef.getUnsafe(frame))
+          if (SubscriptionRef.getUnsafe(role) === "owner") channel.postMessage(SubscriptionRef.getUnsafe(frame))
         })
+      // Ignore messages this bundle does not know, such as those of a newer bundle.
+      if (value !== "replica" && value !== "changed" && value !== "sync") return Effect.void
       return locked(
         Effect.gen(function* () {
           yield* publish()
@@ -936,22 +947,119 @@ const openClient = Effect.fnUntraced(function* (options: Options) {
     Effect.ignore,
     Effect.forkScoped
   )
-  if (options.autoConnect !== false)
+  const announce = Effect.sync(() => {
+    const current = SubscriptionRef.getUnsafe(status)
+    if (SubscriptionRef.getUnsafe(role) !== "owner" || !Schema.is(OwnerStatus.fields.connection)(current.connection))
+      return
+    statusChannel.postMessage({
+      connection: current.connection,
+      lastSynced: current.lastSynced,
+      error: current.error === null ? null : Schema.is(Tagged)(current.error) ? current.error._tag : "Error"
+    } satisfies typeof OwnerStatus.Type)
+  })
+  yield* Stream.fromEventListener<MessageEvent>(statusChannel, "message").pipe(
+    Stream.runForEach((event) => {
+      const value: unknown = event.data
+      const current = SubscriptionRef.getUnsafe(role)
+      if (value === "request") return current === "owner" ? announce : Effect.void
+      if (value === "released") return SubscriptionRef.update(role, (r) => (r === "peer" ? "unknown" : r))
+      if (current === "owner" || !Schema.is(OwnerStatus)(value)) return Effect.void
+      return Effect.gen(function* () {
+        yield* SubscriptionRef.update(role, (r) => (r === "owner" ? r : "peer"))
+        // Reset and incompatible are this tab's own durable findings; an owner's report never replaces them.
+        if (closed || SubscriptionRef.getUnsafe(role) === "owner") return
+        yield* SubscriptionRef.update(status, (s): Status => ({
+          ...s,
+          connection: value.connection,
+          lastSynced: value.lastSynced,
+          error:
+            value.error === null
+              ? null
+              : value.error === "TransportError" && value.connection !== "idle" && value.connection !== "syncing"
+                ? new TransportError({ reason: value.connection, cause: "reported by the tab that owns the network" })
+                : new ClientError({ cause: value.error })
+        }))
+      })
+    }),
+    Effect.race(Deferred.await(stopped)),
+    Effect.ignore,
+    Effect.forkScoped
+  )
+  const awaitRole = (done: (value: "owner" | "peer" | "unknown") => boolean) =>
+    SubscriptionRef.changes(role).pipe(Stream.filter(done), Stream.runHead)
+  const leader = `echosync:${namespace}:leader`
+  /** Finds who reports the profile's status, and asks again every minute, because a closed or crashed
+   * owner sends no "released". A tab of an older bundle can own the network without reporting;
+   * then an automatically connecting tab syncs itself, at most once a minute, to show a real result. */
+  const follow = Effect.forever(
+    Effect.gen(function* () {
+      if (Option.isNone(yield* awaitRole((value) => value === "unknown").pipe(Effect.timeoutOption("60 seconds")))) {
+        yield* SubscriptionRef.update(role, (value) => (value === "peer" ? "unknown" : value))
+        if (SubscriptionRef.getUnsafe(role) !== "unknown") return
+      }
+      statusChannel.postMessage("request")
+      if (Option.isSome(yield* awaitRole((value) => value !== "unknown").pipe(Effect.timeoutOption("1 second")))) return
+      const silentOwner =
+        options.autoConnect !== false &&
+        (yield* Effect.tryPromise({
+          try: () => navigator.locks.query(),
+          catch: (cause) => new ClientError({ cause })
+        }).pipe(
+          Effect.map((locks) => Arr.some(locks.held ?? [], (lock) => lock.name === leader)),
+          Effect.orElseSucceed(() => false)
+        ))
+      if (silentOwner) {
+        const stop = yield* sync.pipe(
+          Effect.as(false),
+          Effect.catchIf(
+            (error) => error._tag !== "ClientClosed",
+            (error) =>
+              Effect.succeed(
+                error._tag === "TransportError" && (error.reason === "auth" || error.reason === "oversized")
+              )
+          )
+        )
+        // Like the owner, auth and oversized failures stop automation until a reporting owner appears.
+        if (stop) {
+          yield* awaitRole((value) => value !== "unknown")
+          return
+        }
+      }
+      yield* awaitRole((value) => value !== "unknown").pipe(Effect.timeoutOption("60 seconds"))
+    })
+  )
+  if (options.autoConnect !== false) {
     yield* Effect.forkScoped(
       Storage.withLock(
         `${namespace}:leader`,
         Effect.gen(function* () {
-          isNetworkOwner = true
+          yield* SubscriptionRef.set(role, "owner")
+          // Every change of the network fields, starting with the current ones.
+          yield* SubscriptionRef.changes(status).pipe(
+            Stream.changesWith(
+              (a, b) => a.connection === b.connection && a.lastSynced === b.lastSynced && a.error === b.error
+            ),
+            Stream.runForEach(() => announce),
+            Effect.forkScoped
+          )
           yield* connect
         }).pipe(
+          // Still under the lock, so a successor's first report follows these. The final state
+          // (such as auth) is announced here because the announcer may not have run yet.
           Effect.ensuring(
-            Effect.sync(() => {
-              isNetworkOwner = false
-            })
+            Effect.andThen(
+              announce,
+              Effect.andThen(
+                SubscriptionRef.set(role, "unknown"),
+                Effect.sync(() => statusChannel.postMessage("released"))
+              )
+            )
           )
         )
       ).pipe(Effect.race(Deferred.await(stopped)))
     )
+  }
+  yield* follow.pipe(Effect.race(Deferred.await(stopped)), Effect.ignore, Effect.forkScoped)
   channel.postMessage("hello")
   const presence = Effect.fn("EchoSync.Client.presence")(function* (
     room: Scope,
@@ -1048,5 +1156,12 @@ const openClient = Effect.fnUntraced(function* (options: Options) {
 })
 
 const ProtocolEpoch = Schema.TaggedStruct("ResyncRequired", { epoch: Schema.String })
+const Tagged = Schema.Struct({ _tag: Schema.String })
+/** The network owner's report to other tabs. Reset and incompatible are each tab's own state. */
+const OwnerStatus = Schema.Struct({
+  connection: Schema.Literals(["idle", "syncing", "offline", "error", "auth", "oversized"]),
+  lastSynced: Schema.NullOr(Schema.Finite),
+  error: Schema.NullOr(Schema.String)
+})
 export const open = (options: Options) => Telemetry.measure("open", openClient(options), options.onTelemetry)
 export type Client = Effect.Success<ReturnType<typeof open>>
