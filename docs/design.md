@@ -756,6 +756,20 @@ behaviour adds or amends an item here in the same branch.
     error. Continuations, expiry and the grant/generation checks are unchanged. Rejected:
     staging only the overflow (two code paths for one view) and a byte-bounded first page.
 
+44. **Pending intents share Execute requests** (2026-11-18). The client sent one intent per
+    Execute and pulled after each, so a backlog of N offline intents cost 2N sequential round
+    trips (80 for 40 tags defined offline), although Execute already accepts many batches.
+    Sync now sends up to 32 journal-ordered intents per request, and at most about 4 Mi characters
+    of commands (always at least one intent) so large intents stay under the server's 16 Mi
+    request frame instead of failing at decode on every retry, recovering `Sent` intents the
+    same way, then pulls once. The server still decides every batch in its own transaction in
+    request order and returns one receipt each, so a rejection affects only its intent, and a
+    lost response leaves all of them `Sent` for receipt recovery by identity. Intents after a
+    rejection are decided by the server against authoritative state instead of being rejected
+    locally after a pull; the outcome is the same rejection notice when they depend on it.
+    An epoch reset racing a request marks every `Sent` intent in it `Unknown`, as it did for one.
+    Rejected: one request for the whole backlog (unbounded body) and keeping per-intent pulls.
+
 ## 3. Invariants catalogue
 
 The behaviours a rule-abiding engine promises, as a numbered list `INV-<AREA>-<n>`, one or
@@ -887,6 +901,9 @@ devices), `SCHEMA` (versions, upcasters, floor), `PRESENCE`.
 - **INV-CLIENT-10:** Opt-in telemetry correlates acquisition, complete sync and nested operation
   lifecycles using fresh UUIDs and only allowlisted scalar fields. Observer failures cannot
   affect operations; stalled observations neither cancel work nor survive completion/interruption.
+- **INV-CLIENT-11:** A reconnecting device sends its pending backlog in journal order, up to 32
+  intents (and a bounded size) per Execute request, then pulls once per request; each intent keeps its own receipt,
+  so a server rejection inside a shared request becomes that intent's notice only.
 - **INV-SERVER-12:** Structured operation logs distinguish Pull page work from Changes
   connection lifetime without payloads, identifiers or raw failures, preserving request log
   annotations and operation outcomes.

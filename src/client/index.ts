@@ -635,27 +635,48 @@ const openClient = Effect.fnUntraced(function* (options: Options) {
     )
     return { ...Telemetry.pageMetrics({ scopes: completeScopes }), pageCount }
   })
-  const send = Effect.fnUntraced(function* (intent: Model.Intent) {
+  // Journal-ordered intents per Execute. The server decides each batch in its own transaction
+  // and returns one receipt per batch, so one request replaces a round trip per intent.
+  const batchLimit = 32
+  // Server request frames are capped at 16 Mi UTF-16 units; leave room so a backlog of large
+  // intents splits across requests instead of failing at decode forever.
+  const batchChars = 4 * 1024 * 1024
+  // Leading journal-ordered intents that fit one request; always at least one.
+  const take = (intents: ReadonlyArray<Model.Intent>) => {
+    let chars = 0
+    let n = 0
+    for (const intent of intents) {
+      // oxlint-disable-next-line effecttsgo/global-json -- Journal intents are already decoded JSON values, so stringify cannot throw.
+      chars += JSON.stringify(intent.action ?? intent.commands).length
+      if (n === batchLimit || (n > 0 && chars > batchChars)) break
+      n++
+    }
+    return Arr.take(intents, n)
+  }
+  const send = Effect.fnUntraced(function* (intents: ReadonlyArray<Model.Intent>) {
     const request = yield* locked(
       Effect.gen(function* () {
-        const current = Arr.findFirst(journal.intents, (i) => i.id === intent.id)
-        if (Option.isNone(current) || (current.value.phase !== "Pending" && current.value.phase !== "Sent")) return
+        const ids = new Set(Arr.map(intents, (intent) => intent.id))
+        const sending = Arr.filter(
+          journal.intents,
+          (i) => ids.has(i.id) && (i.phase === "Pending" || i.phase === "Sent")
+        )
+        if (sending.length === 0) return
+        const sendingIds = new Set(Arr.map(sending, (i) => i.id))
         yield* writeJournal({
           ...journal,
           intents: Arr.map(journal.intents, (i) =>
-            i.id === intent.id ? { ...i, phase: "Sent", attemptEpoch: journal.epoch } : i
+            sendingIds.has(i.id) ? { ...i, phase: "Sent", attemptEpoch: journal.epoch } : i
           )
         })
         return {
           epoch: journal.epoch,
           clientId: journal.clientId,
-          batches: [
-            {
-              id: intent.id,
-              commands: intent.commands,
-              ...(intent.action === undefined ? {} : { action: intent.action })
-            }
-          ]
+          batches: Arr.map(sending, (intent) => ({
+            id: intent.id,
+            commands: intent.commands,
+            ...(intent.action === undefined ? {} : { action: intent.action })
+          }))
         }
       })
     )
@@ -670,21 +691,23 @@ const openClient = Effect.fnUntraced(function* (options: Options) {
     }
     yield* locked(
       Effect.gen(function* () {
-        const receipt = Option.getOrUndefined(Arr.findFirst(response.receipts, (r) => r.batchId === intent.id))
-        if (receipt === undefined) return yield* new ClientError({ cause: "Missing receipt" })
+        const receipts = new Map(Arr.map(response.receipts, (r) => [r.batchId, r]))
+        if (Arr.some(request.batches, (batch) => !receipts.has(batch.id)))
+          return yield* new ClientError({ cause: "Missing receipt" })
         yield* writeJournal({
           ...journal,
           epoch: response.epoch,
-          intents: Arr.map(journal.intents, (i) =>
-            i.id === intent.id
-              ? {
+          intents: Arr.map(journal.intents, (i) => {
+            const receipt = receipts.get(i.id)
+            return receipt === undefined
+              ? i
+              : {
                   ...i,
                   phase: receipt._tag,
                   receipt,
                   rejection: receipt._tag === "Rejected" ? receipt.rejection : null
                 }
-              : i
-          )
+          })
         })
         // Rejections are visible even if the following pull fails; accepted predictions remain until covered.
         yield* publish()
@@ -700,18 +723,22 @@ const openClient = Effect.fnUntraced(function* (options: Options) {
           yield* SubscriptionRef.update(status, (s): Status => ({ ...s, connection: "syncing", error: null }))
           // Recover lost receipts BEFORE applying any newer snapshot: otherwise a non-idempotent prediction doubles.
           const sent = yield* locked(Effect.sync(() => Arr.filter(journal.intents, (i) => i.phase === "Sent")))
-          for (const intent of sent) yield* send(intent)
+          for (let rest = sent; rest.length > 0;) {
+            const chunk = take(rest)
+            yield* send(chunk)
+            rest = Arr.drop(rest, chunk.length)
+          }
           let totals = yield* pull
           while (true) {
-            const intent = yield* locked(
+            const pending = yield* locked(
               Effect.gen(function* () {
                 yield* publish()
-                if (SubscriptionRef.getUnsafe(status).compatibilityIssues.length > 0) return undefined
-                return Option.getOrUndefined(Arr.findFirst(journal.intents, (i) => i.phase === "Pending"))
+                if (SubscriptionRef.getUnsafe(status).compatibilityIssues.length > 0) return []
+                return take(Arr.filter(journal.intents, (i) => i.phase === "Pending"))
               })
             )
-            if (intent === undefined) break
-            yield* send(intent)
+            if (pending.length === 0) break
+            yield* send(pending)
             const next = yield* pull
             totals = {
               count: (totals.count ?? 0) + (next.count ?? 0),

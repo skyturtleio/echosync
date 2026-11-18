@@ -16,7 +16,7 @@ import * as Stream from "effect/Stream"
 import * as Str from "effect/String"
 import * as SubscriptionRef from "effect/SubscriptionRef"
 import { FetchHttpClient, HttpClient } from "effect/http"
-import { DefineTag, Note, NoteId, Tag, TagId, WriteNote } from "../../examples/fixture/domain/src/index.ts"
+import { DefineTag, Note, NoteId, RemoveTag, Tag, TagId, WriteNote } from "../../examples/fixture/domain/src/index.ts"
 import { MoveTag } from "../../examples/fixture/domain/src/Tag/MoveTag.command.ts"
 import {
   LegacyTally,
@@ -1373,6 +1373,73 @@ const largeCatalog = (profile: string, reload: boolean) =>
       // transport deadline: those are 30 s per request. Page count dominates; see Sync.pageSize.
       yield* check(elapsed < 5_000, `large catalog sync exceeded 5s: ${elapsed.toFixed(1)}ms`)
       return `PASS INV-SYNC-1 ${reload ? "durable navigation/reopen, unchanged Pull" : "HTTP/PG catalog"}: 84780 exact rows, ${received} received, ${elapsed.toFixed(1)}ms`
+    })
+  )
+
+// INV-CLIENT-11: a reconnecting backlog shares Execute requests without reordering or hiding rejections.
+const offlineBacklog = (profile: string) =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const http = yield* Client.httpTransport(`${location.origin}/sync`)
+      const base = { profile, principal, aggregates: [Tag, Note], autoConnect: false }
+      const id = (i: number) => TagId.make(`${profile}-${i}`)
+      const claimed = `${profile}-claimed`
+      // 40 defines, one of them claiming a name a peer takes while this device is offline, then a
+      // removal that the server accepts only after the first define: 41 intents in journal order.
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const offlineClient = yield* Client.open({ ...base, transport: disconnected })
+          for (let i = 0; i < 40; i++)
+            yield* offlineClient.execute(Tag, new DefineTag({ target: id(i), name: i === 20 ? claimed : id(i) }))
+          yield* offlineClient.execute(Tag, new RemoveTag({ target: id(0) }))
+        })
+      )
+      // The peer commits after this device's first catchup, so only the server can reject the claim.
+      const peer = http.execute({
+        epoch: null,
+        clientId: `${profile}-peer`,
+        batches: [
+          {
+            id: `${profile}-peer`,
+            commands: [{ aggregate: "Tag", command: { _tag: "DefineTag", target: `${profile}-peer`, name: claimed } }]
+          }
+        ]
+      })
+      const requests: Array<number> = []
+      const client = yield* Client.open({
+        ...base,
+        transport: {
+          ...http,
+          execute: Effect.fnUntraced(function* (request) {
+            if (requests.length === 0) yield* peer
+            requests.push(request.batches.length)
+            return yield* http.execute(request)
+          })
+        }
+      })
+      yield* client.sync
+      yield* check(
+        requests.length === 2 && requests[0] === 32 && requests[1] === 9,
+        `backlog used ${requests.length} Execute requests: ${Arr.join(Arr.map(requests, String), ",")}`
+      )
+      yield* check(client.query((read) => read.get(Tag, id(0)))?.removed === true, "removal reordered before define")
+      yield* check(
+        client.query((read) => Arr.filter(read.scan(Tag), (row) => Str.startsWith(`${profile}-`)(row.id))).length ===
+          40,
+        "accepted backlog did not install"
+      )
+      yield* check(client.query((read) => read.get(Tag, id(20))) === null, "rejected claim kept its prediction")
+      const notices = yield* Stream.runHead(client.notices)
+      yield* check(
+        notices._tag === "Some" &&
+          notices.value.length === 1 &&
+          notices.value[0]?.phase === "Rejected" &&
+          Schema.is(Schema.Struct({ target: Schema.Literal(id(20)) }))(notices.value[0].commands[0]?.command) &&
+          notices.value[0].receipt?._tag === "Rejected",
+        "server rejection inside a shared request was not surfaced"
+      )
+      yield* check((yield* client.pending).length === 0, "accepted backlog stayed pending")
+      return `PASS INV-CLIENT-11 41 offline intents in ${requests.length} Execute requests (${Arr.join(Arr.map(requests, String), "+")}); journal order and one rejection preserved`
     })
   )
 
@@ -2872,6 +2939,7 @@ Object.assign(globalThis, {
     incompatibleCommands: (profile: string) => run(incompatibleCommands(profile)),
     durableRefresh: (profile: string) => run(durableRefresh(profile)),
     batches: (profile: string) => run(batches(profile)),
+    offlineBacklog: (profile: string) => run(offlineBacklog(profile)),
     ownership: (profile: string) => run(ownership(profile)),
     diagnostics: (profile: string) => run(diagnostics(profile)),
     largeCatalog: (profile: string, reload = false) => run(largeCatalog(profile, reload)),
