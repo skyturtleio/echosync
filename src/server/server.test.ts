@@ -1900,7 +1900,9 @@ describe.skipIf(url === undefined)("Postgres server", () => {
         yield* Scope.provide(sql.reserve, blocked)
         yield* acquisitionClient`SELECT pg_notify('echosync_changes','presence')`
         while ((yield* sql.poolStats).pending === 0) yield* Effect.yieldNow
-        yield* TestClock.adjust("20 seconds")
+        // Stop exactly at the refresh deadline: reader cleanup may start while this adjust is still
+        // waking sleeps, and its own 5-second deadline must lie beyond it.
+        yield* TestClock.adjust("15 seconds")
         // Socket shutdown is real I/O; wait until the readers actually enter their cleanup deadline.
         while ((yield* sql.poolStats).pending < readers.length - 1) yield* Effect.yieldNow
         yield* TestClock.adjust("5 seconds")
